@@ -430,8 +430,11 @@ function notFoundResult(detail: string): UpdateRunResult {
   return { ok: false, exitCode: null, output: '', error: detail, errorCode: 'not-found' }
 }
 
-/** Read the latest git commit for a git-clone row (network probe). */
-export function latestGitCommit(target: UpdateTarget): string | undefined {
+/** Read the latest git commit for an update target (network probe). */
+export function latestGitCommit(target: UpdateTarget, remoteOverride?: string, refOverride?: string): string | undefined {
+  if (remoteOverride !== undefined) {
+    return fetchLatestCommit(remoteOverride, refOverride)
+  }
   const root = target.gitRoot ?? target.dir
   if (root === undefined) return undefined
   const info = readGitInfo(root)

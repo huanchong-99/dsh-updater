@@ -105,6 +105,7 @@ export function UpdaterSection(props: UpdaterSectionProps): React.ReactNode {
         <table className={css.table}>
           <thead>
             <tr>
+              <th>{t('plugin')}</th>
               <th>{t('profile')}</th>
               <th>{t('source')}</th>
               <th>{t('current')}</th>
@@ -118,12 +119,12 @@ export function UpdaterSection(props: UpdaterSectionProps): React.ReactNode {
               const row = rows[key]
               return (
                 <tr key={key} data-outdated={record.outdated ? 'true' : 'false'}>
-                  <td className={css.profile}>{record.profile}</td>
+                  <td className={css.name} title={record.name}>{record.name}</td>
+                  <td className={css.profile} title={t('profileHint')}>{record.profile}</td>
                   <td>
                     <span className={css.badge} data-kind={record.kind} title={t(`sourceLabel.${record.kind}`)}>
                       {t(`kind.${record.kind}`)}
                     </span>
-                    <div className={css.name}>{record.name}</div>
                   </td>
                   <td className={css.mono}>{record.current ?? '-'}</td>
                   <td className={css.mono}>{record.latest ?? '-'}</td>
@@ -152,6 +153,7 @@ export function UpdaterSection(props: UpdaterSectionProps): React.ReactNode {
           </tbody>
         </table>
       )}
+      <p className={css.muted}>{t('profileHint')}</p>
       <p className={css.muted}>{t('restartHint')}</p>
     </div>
   )

@@ -188,15 +188,64 @@ export function readGitInfo(dir: string): GitInfo | undefined {
   return { root, remote, branch, commit, dirty: status !== '' }
 }
 
-/** Probe the latest commit of a git remote+branch (short hash, undefined on failure). */
-export function fetchLatestCommit(remote: string, branch: string): string | undefined {
-  const result = spawnSync('git', ['ls-remote', remote, `refs/heads/${branch}`], {
+/**
+ * Probe the latest commit of a remote git ref (branch, tag, or HEAD; a full
+ * commit hash is not probed because a pinned commit is fixed by definition).
+ * Returns the short hash, or undefined on any failure.
+ */
+export function fetchLatestCommit(remote: string, ref?: string): string | undefined {
+  if (remote === '' || ref === undefined || ref === '') {
+    return fetchLatestCommit(remote, 'HEAD')
+  }
+  if (/^[0-9a-fA-F]{40}$/.test(ref)) return undefined
+  const patterns = ref === 'HEAD'
+    ? ['HEAD']
+    : [ref, `refs/heads/${ref}`, `refs/tags/${ref}`]
+  const result = spawnSync('git', ['ls-remote', remote, ...patterns], {
     encoding: 'utf8',
     timeout: 15_000,
   })
   if (result.status !== 0) return undefined
   const first = result.stdout.trim().split(/\s+/)[0]
   return first === undefined || first === '' ? undefined : first.slice(0, 7)
+}
+
+/** Parsed git spec for `github:`, `git+...`, and scp-like remotes. */
+export interface GitSpecRef {
+  remote: string
+  ref?: string
+}
+
+/**
+ * Parse a pnpm git-hosted dependency spec into a remote URL + ref. Supports
+ * `github:owner/repo#ref`, `git+https://...git#ref`, and scp-like URLs.
+ */
+export function parseGitSpec(spec: string): GitSpecRef | undefined {
+  const hashIndex = spec.indexOf('#')
+  const base = hashIndex >= 0 ? spec.slice(0, hashIndex) : spec
+  const ref = hashIndex >= 0 ? spec.slice(hashIndex + 1) || undefined : undefined
+  let remote: string | undefined
+  const githubMatch = /^github:([^/]+\/[A-Za-z0-9_.-]+)/.exec(base)
+  if (githubMatch !== null) {
+    remote = `https://github.com/${githubMatch[1]}.git`
+  } else {
+    const urlMatch = /^(?:git\+|git:)?(https?:\/\/\S+|ssh:\/\/\S+|git@\S+)$/.exec(base)
+    if (urlMatch !== null) remote = urlMatch[1]
+  }
+  return remote === undefined ? undefined : { remote, ref }
+}
+
+/** Read the full 40-hex commit pnpm resolved for one git-hosted dependency. */
+export function readPnpmGitResolution(profileDir: string, name: string): string | undefined {
+  try {
+    const lock = readFileSync(join(profileDir, 'pnpm-lock.yaml'), 'utf8')
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(`${escaped}@https://[^\\s]+/tar\\.gz/([0-9a-f]{40})`)
+    const match = re.exec(lock)
+    return match?.[1]
+  } catch {
+    return undefined
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -285,13 +334,16 @@ export function inspectDependency(profile: string, profileDir: string, name: str
     if (dir === undefined) {
       return { ...base, kind: 'pnpm-git', error: 'installed checkout not resolvable' }
     }
-    const git = readGitInfo(dir)
+    const installedGit = readGitInfo(dir)
+    const specGit = parseGitSpec(spec)
+    const resolvedCommit = readPnpmGitResolution(profileDir, name)
+    const current = installedGit?.commit ?? (resolvedCommit === undefined ? readPackageVersion(dir) : resolvedCommit.slice(0, 7))
     return {
       ...base,
       kind: 'pnpm-git',
       dir,
-      current: git?.commit ?? readPackageVersion(dir),
-      git,
+      current,
+      git: installedGit ?? (specGit === undefined ? undefined : { remote: specGit.remote, branch: specGit.ref }),
     }
   }
 
@@ -310,7 +362,7 @@ export function inspectDependency(profile: string, profileDir: string, name: str
   }
 }
 
-/** Scan all profiles and classify every dependency. */
+/** Scan all profiles and classify every dependency plus every profile bundle. */
 export function scanProfiles(home: string = dshHome()): UpdaterStatus {
   const records: PluginRecord[] = []
   const profiles: string[] = []
@@ -318,11 +370,43 @@ export function scanProfiles(home: string = dshHome()): UpdaterStatus {
     profiles.push(name)
     const manifest = readManifest(join(dir, 'package.json'))
     const dependencies = manifest?.dependencies
-    if (typeof dependencies !== 'object' || dependencies === null) continue
-    for (const [packageName, specRaw] of Object.entries(dependencies)) {
-      if (typeof specRaw !== 'string') continue
-      records.push(inspectDependency(name, dir, packageName, specRaw))
+    const dependencyNames = new Set<string>()
+    if (typeof dependencies === 'object' && dependencies !== null) {
+      for (const [packageName, specRaw] of Object.entries(dependencies)) {
+        if (typeof specRaw !== 'string') continue
+        dependencyNames.add(packageName)
+        records.push(inspectDependency(name, dir, packageName, specRaw))
+      }
+    }
+    // Profile bundle entries that are not plain dependencies are still
+    // installed plugins (the installation-owned bundles dsh-base and
+    // dsh-web-app, for example). Include them so the panel shows the real
+    // plugin count and their versions.
+    const bundleSection = manifest?.dsh
+    const bundles = typeof bundleSection === 'object' && bundleSection !== null
+      ? (bundleSection as { profile?: { bundles?: unknown } }).profile?.bundles
+      : undefined
+    if (Array.isArray(bundles)) {
+      for (const bundle of bundles) {
+        if (typeof bundle !== 'string' || dependencyNames.has(bundle)) continue
+        records.push(inspectProfileBundle(name, dir, bundle))
+      }
     }
   }
   return { profiles, records, checkedAt: new Date().toISOString() }
+}
+
+/** Classify a profile bundle that has no matching dependency entry. */
+export function inspectProfileBundle(profile: string, profileDir: string, name: string): PluginRecord {
+  const base: PluginRecord = { profile, name, spec: '(profile bundle)', kind: 'installation-owned', outdated: false }
+  const dir = resolveInstalledDir(profileDir, name)
+  if (dir === undefined) {
+    return { ...base, error: 'profile bundle not resolvable' }
+  }
+  return {
+    ...base,
+    kind: 'installation-owned',
+    dir,
+    current: readPackageVersion(dir),
+  }
 }

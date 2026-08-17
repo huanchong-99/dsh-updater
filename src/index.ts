@@ -92,9 +92,20 @@ async function readStatus(): Promise<UpdaterStatus> {
         && compareVersions(latest, record.current) > 0
       return { ...record, latest, outdated }
     }
-    if (record.kind === 'git-clone' || record.kind === 'pnpm-git') {
+    if (record.kind === 'git-clone') {
       const target = resolveTarget(record)
       const latest = target === undefined ? undefined : latestGitCommit(target)
+      const outdated = latest !== undefined && record.current !== undefined && latest !== record.current
+      return { ...record, latest, outdated }
+    }
+    if (record.kind === 'pnpm-git') {
+      // The installed checkout usually has no .git metadata, so use the spec
+      // remote + ref when available; pnpm's lockfile gives the resolved
+      // commit for the local side of the comparison.
+      const target = resolveTarget(record)
+      const remote = record.git?.remote
+      const ref = record.git?.branch
+      const latest = target === undefined ? undefined : latestGitCommit(target, remote, ref)
       const outdated = latest !== undefined && record.current !== undefined && latest !== record.current
       return { ...record, latest, outdated }
     }
