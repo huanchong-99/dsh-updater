@@ -1,0 +1,9 @@
+# One standalone dual-face plugin. Install it into a dsh profile with
+# `dsh plugin --profile <name> add link:...` or from a git/npm source.
+# The single row mounts both halves: the host side (profile scan,
+# classification, update executors, /api/plugin-updater routes) and the
+# browser side (the settings panel served from lib/client.js).
+
+- insert:
+    - id: plugin-updater
+      name: dsh-updater

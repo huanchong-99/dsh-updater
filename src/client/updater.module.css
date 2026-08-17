@@ -1,0 +1,148 @@
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.heading {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.lede {
+  margin: 0;
+  color: var(--color-text-secondary, #888);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.button {
+  border: 1px solid var(--color-border, #333);
+  background: transparent;
+  color: inherit;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  vertical-align: top;
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--color-border, #333);
+}
+
+.profile {
+  font-weight: 600;
+}
+
+.name {
+  margin-top: 2px;
+  color: var(--color-text-secondary, #888);
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.badge {
+  display: inline-block;
+  border: 1px solid var(--color-border, #333);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.badge[data-kind='npm'] {
+  border-color: #4c9aff;
+  color: #4c9aff;
+}
+
+.badge[data-kind='git-clone'] {
+  border-color: #3fb950;
+  color: #3fb950;
+}
+
+.badge[data-kind='pnpm-git'] {
+  border-color: #a371f7;
+  color: #a371f7;
+}
+
+.badge[data-kind='installation-owned'] {
+  border-color: #d29922;
+  color: #d29922;
+}
+
+.badge[data-kind='local-only'] {
+  border-color: #8b949e;
+  color: #8b949e;
+}
+
+.mono {
+  font-family: var(--font-mono, Consolas, monospace);
+  word-break: break-all;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.outdated {
+  color: #ff7b72;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.uptodate {
+  color: #3fb950;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.muted {
+  color: var(--color-text-secondary, #888);
+  font-size: 12px;
+}
+
+.error {
+  color: #ff7b72;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log {
+  margin: 6px 0 0;
+  max-height: 120px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+  color: var(--color-text-secondary, #888);
+  border: 1px solid var(--color-border, #333);
+  border-radius: 6px;
+  padding: 6px;
+}
