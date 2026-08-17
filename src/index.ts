@@ -29,7 +29,7 @@ import {
   type UpdateRunResult,
   type UpdateTarget,
 } from './update.ts'
-import { isTrustedUpdaterRequest, makeUpdaterRoutes, UPDATE_PATHS } from './routes.ts'
+import { isTrustedUpdaterRequest, makeUpdaterRoutes, UPDATE_PATHS, type UpdateRunOptions } from './routes.ts'
 
 /** Stable cordis plugin name. */
 export const name = 'dsh-updater'
@@ -124,16 +124,17 @@ export function apply(ctx: Context): void {
       fence: request => isTrustedUpdaterRequest(request),
       status: () => readStatus(),
       resolveTarget,
-      run: async (target: UpdateTarget): Promise<UpdateRunResult> => {
-        if (target.kind === 'npm') {
-          const profile = listProfileDirs().find(entry => entry.name === target.profile)
-          const before = target.dir === undefined ? undefined : readPackageVersion(target.dir)
-          const result = await runTargetUpdate(target)
+      run: async (target: UpdateTarget, options?: UpdateRunOptions): Promise<UpdateRunResult> => {
+        const effectiveTarget = options?.autostash === true ? { ...target, autostash: true } : target
+        if (effectiveTarget.kind === 'npm') {
+          const profile = listProfileDirs().find(entry => entry.name === effectiveTarget.profile)
+          const before = effectiveTarget.dir === undefined ? undefined : readPackageVersion(effectiveTarget.dir)
+          const result = await runTargetUpdate(effectiveTarget)
           if (!result.ok) return result
           if (profile === undefined) return result
-          return verifyNpmUpdate(profile.dir, target.name, before, fetch)
+          return verifyNpmUpdate(profile.dir, effectiveTarget.name, before, fetch)
         }
-        return runTargetUpdate(target)
+        return runTargetUpdate(effectiveTarget)
       },
     })
     const disposers = routes.map(route => ctx.webServer.register(route))

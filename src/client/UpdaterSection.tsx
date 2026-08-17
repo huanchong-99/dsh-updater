@@ -56,11 +56,11 @@ export function UpdaterSection(props: UpdaterSectionProps): React.ReactNode {
     return () => { token.current++ }
   }, [check])
 
-  const runOne = useCallback(async (record: PluginRecord): Promise<void> => {
+  const runOne = useCallback(async (record: PluginRecord, autostash = false): Promise<void> => {
     const key = `${record.profile}\0${record.name}`
     setRows(prev => ({ ...prev, [key]: { running: true } }))
     try {
-      const result = await runPluginUpdate({ profile: record.profile, name: record.name })
+      const result = await runPluginUpdate({ profile: record.profile, name: record.name, autostash })
       setRows(prev => ({ ...prev, [key]: { running: false, result } }))
     } catch (error) {
       setRows(prev => ({ ...prev, [key]: { running: false, result: { ok: false, exitCode: null, output: '', error: error instanceof Error ? error.message : String(error) } } }))
@@ -138,6 +138,17 @@ export function UpdaterSection(props: UpdaterSectionProps): React.ReactNode {
                       >
                         {row?.running === true ? t('running') : t('update')}
                       </button>
+                      {record.kind === 'git-clone' && (
+                        <button
+                          type="button"
+                          className={css.button}
+                          disabled={row?.running === true}
+                          title={t('updateStashHint')}
+                          onClick={() => { void runOne(record, true) }}
+                        >
+                          {row?.running === true ? t('running') : t('updateStash')}
+                        </button>
+                      )}
                       <span className={record.outdated ? css.outdated : css.uptodate}>
                         {record.outdated ? t('outdated') : t('uptodate')}
                       </span>

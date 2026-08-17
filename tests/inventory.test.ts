@@ -4,8 +4,10 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { join } from 'node:path'
 import {
   compareVersions,
+  fetchLatestCommit,
   findGitRoot,
   inspectDependency,
   isGitSpec,
@@ -40,7 +42,7 @@ describe('localSpecPath', () => {
 
   it('anchors relative specs to the profile directory', () => {
     const result = localSpecPath('link:../plugin', 'C:/Users/u/.dsh/profiles/web')
-    expect(result).toBe('C:/Users/u/.dsh/profiles/plugin')
+    expect(result).toBe(join('C:/Users/u/.dsh/profiles', 'plugin'))
   })
 })
 
@@ -67,6 +69,13 @@ describe('semver', () => {
 describe('listProfileDirs', () => {
   it('returns an empty list for a nonexistent home', () => {
     expect(listProfileDirs('E:/definitely/not/a/dsh/home')).toEqual([])
+  })
+})
+
+describe('fetchLatestCommit', () => {
+  it('does not probe pinned 40-hex commit refs', () => {
+    const remote = 'https://github.com/huanchong-99/dsh-updater.git'
+    expect(fetchLatestCommit(remote, 'c0c26d7e2402b8c05663709c17c6fa09cbd1d045')).toBeUndefined()
   })
 })
 

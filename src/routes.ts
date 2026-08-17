@@ -27,6 +27,11 @@ export interface RunRequestBody {
   profile?: string
   /** Update a single package by name (within `profile` when given). */
   name?: string
+  /**
+   * Allow dirty git-clone work trees to update via `git pull --ff-only
+   * --autostash`. Defaults to false: dirty clones are refused.
+   */
+  autostash?: boolean
 }
 
 /** Route-family dependencies (test seam). */
@@ -38,7 +43,12 @@ export interface UpdaterRoutesDeps {
   /** Resolve a concrete update target for one record. */
   resolveTarget(record: PluginRecord): UpdateTarget | undefined
   /** Execute one update target and return the result. */
-  run(target: UpdateTarget): Promise<UpdateRunResult>
+  run(target: UpdateTarget, options?: UpdateRunOptions): Promise<UpdateRunResult>
+}
+
+/** Optional modifiers for one update run. */
+export interface UpdateRunOptions {
+  autostash?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +197,7 @@ export function makeUpdaterRoutes(deps: UpdaterRoutesDeps): WebRoute[] {
  */
 async function runRequested(deps: UpdaterRoutesDeps, request: RunRequestBody): Promise<UpdateRunResult> {
   const status = await deps.status()
+  const options: UpdateRunOptions = { autostash: request.autostash === true }
   let records = status.records
   if (request.profile !== undefined) {
     records = records.filter(record => record.profile === request.profile)
@@ -213,7 +224,7 @@ async function runRequested(deps: UpdaterRoutesDeps, request: RunRequestBody): P
         if (seenGitRoots.has(target.gitRoot)) continue
         seenGitRoots.add(target.gitRoot)
       }
-      const result = await deps.run(target)
+      const result = await deps.run(target, options)
       combined += result.output
       if (!result.ok) return { ...result, output: combined }
     }
@@ -223,5 +234,5 @@ async function runRequested(deps: UpdaterRoutesDeps, request: RunRequestBody): P
   if (target === undefined) {
     return { ok: false, exitCode: null, output: '', error: `cannot update ${records[0].kind} package`, errorCode: 'unsupported' }
   }
-  return deps.run(target)
+  return deps.run(target, options)
 }

@@ -34,6 +34,7 @@ export type UpdateErrorCode =
   | 'unsupported'
   | 'git-dirty'
   | 'git-failed'
+  | 'git-conflict'
   | 'manager-missing'
   | 'manager-failed'
   | 'build-failed'
@@ -217,6 +218,12 @@ export interface UpdateTarget {
   spec: string
   dir?: string
   gitRoot?: string
+  /**
+   * How a dirty git-clone work tree is handled. `false` (the default)
+   * refuses the update; `true` runs `git pull --ff-only --autostash` so
+   * local edits are stashed before the pull and re-applied afterwards.
+   */
+  autostash?: boolean
 }
 
 /** The pnpm 11 supply-chain gate override: a user-initiated update must not be silently skipped. */
@@ -299,26 +306,52 @@ export async function reconcileProfileBundles(profileDir: string): Promise<void>
 }
 
 /**
- * Update a git-clone: refuse dirty trees, pull fast-forward only, then
- * install and build at the git root. One git root is updated once even when
- * several packages point into the same clone (the run endpoint dedupes).
+ * Update a git-clone: refuse dirty trees by default, or — when the target
+ * asks for it — stash local edits with `git pull --ff-only --autostash`.
+ * Then install and build at the git root. One git root is updated once even
+ * when several packages point into the same clone (the run endpoint dedupes).
  */
 export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunResult> {
   const root = target.gitRoot ?? target.dir
   if (root === undefined) return notFoundResult('git root missing')
 
-  // Dirty check: never overwrite local edits with an update.
+  // Dirty check: never overwrite local edits with an update. Only the
+  // explicit per-row stash action may bypass this via --autostash.
   const dirtyProbe = await runCommand('git', ['-C', root, 'status', '--porcelain'], { cwd: root })
   if (!dirtyProbe.started || dirtyProbe.code !== 0) {
     return { ok: false, exitCode: dirtyProbe.code, output: dirtyProbe.output, error: 'git status failed', errorCode: 'git-failed' }
   }
-  if (dirtyProbe.output.trim() !== '') {
-    return { ok: false, exitCode: null, output: dirtyProbe.output, error: 'git work tree has uncommitted changes; commit or stash them first', errorCode: 'git-dirty' }
-  }
+  const isDirty = dirtyProbe.output.trim() !== ''
 
-  const pull = await runCommand('git', ['-C', root, 'pull', '--ff-only'], { cwd: root })
-  if (pull.code !== 0) {
-    return { ok: false, exitCode: pull.code, output: pull.output, error: 'git pull --ff-only failed', errorCode: 'git-failed' }
+  let pull: { code: number | null; output: string; started: boolean }
+  if (isDirty && target.autostash === true) {
+    pull = await runCommand('git', ['-C', root, 'pull', '--ff-only', '--autostash'], { cwd: root })
+    if (pull.code !== 0) {
+      return { ok: false, exitCode: pull.code, output: pull.output, error: 'git pull --ff-only --autostash failed', errorCode: 'git-failed' }
+    }
+    // `git pull --autostash` exits 0 even when re-applying the stash hit a
+    // conflict; the tree is left conflicted and the stash is kept. Never
+    // install/build over that state.
+    const unmerged = await runCommand('git', ['-C', root, 'diff', '--name-only', '--diff-filter=U'], { cwd: root })
+    if (unmerged.code !== 0) {
+      return { ok: false, exitCode: unmerged.code, output: capOutput(pull.output + '\n' + unmerged.output), error: 'git autostash conflict probe failed', errorCode: 'git-failed' }
+    }
+    if (unmerged.output.trim() !== '') {
+      return {
+        ok: false,
+        exitCode: null,
+        output: capOutput(pull.output + '\n' + unmerged.output),
+        error: 'stashed local changes conflict with the update; git kept the stash, resolve the conflicts and run git stash pop when ready',
+        errorCode: 'git-conflict',
+      }
+    }
+  } else if (isDirty) {
+    return { ok: false, exitCode: null, output: dirtyProbe.output, error: 'git work tree has uncommitted changes; commit or stash them first', errorCode: 'git-dirty' }
+  } else {
+    pull = await runCommand('git', ['-C', root, 'pull', '--ff-only'], { cwd: root })
+    if (pull.code !== 0) {
+      return { ok: false, exitCode: pull.code, output: pull.output, error: 'git pull --ff-only failed', errorCode: 'git-failed' }
+    }
   }
 
   const rootManifest = readManifestObject(join(root, 'package.json'))

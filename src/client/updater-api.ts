@@ -34,10 +34,11 @@ export async function fetchUpdaterStatus(): Promise<UpdaterStatus> {
 /**
  * Run one update. Blocks until the host executor finishes — the panel shows
  * an in-flight state meanwhile.
- * @param body - `{ profile, name }`, `{ profile, all: true }`, or `{ all: true }`.
+ * @param body - `{ profile, name }`, `{ profile, all: true }`, or `{ all: true }`;
+ *   optional `autostash: true` allows dirty git-clone work trees to update.
  * @returns the run outcome.
  */
-export async function runPluginUpdate(body: { profile?: string; name?: string; all?: boolean }): Promise<UpdateRunResult> {
+export async function runPluginUpdate(body: { profile?: string; name?: string; all?: boolean; autostash?: boolean }): Promise<UpdateRunResult> {
   const response = await fetch('/api/plugin-updater/run', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
