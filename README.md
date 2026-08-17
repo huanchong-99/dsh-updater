@@ -33,7 +33,7 @@ other community plugin.
 From this repository:
 
 ```sh
-dsh plugin --profile web add github:<owner>/dsh-updater
+dsh plugin --profile web add github:huanchong-99/dsh-updater
 ```
 
 Local development:

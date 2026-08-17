@@ -30,7 +30,7 @@
 从仓库安装：
 
 ```sh
-dsh plugin --profile web add github:<owner>/dsh-updater
+dsh plugin --profile web add github:huanchong-99/dsh-updater
 ```
 
 本地开发：

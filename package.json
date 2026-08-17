@@ -38,6 +38,10 @@
     "auto-update"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/huanchong-99/dsh-updater.git"
+  },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
