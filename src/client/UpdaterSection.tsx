@@ -83,6 +83,15 @@ export function UpdaterSection(props: UpdaterSectionProps): React.ReactNode {
 
   const outdatedCount = status?.records.filter(record => record.outdated).length ?? 0
 
+  /** A row is actionable only when the status probe found an update, or when
+   *  the probe could not confirm a latest version (network failure). Once a
+   *  row is confirmed up-to-date the buttons stay disabled. */
+  const canUpdate = useCallback((record: PluginRecord): boolean => {
+    if (record.kind === 'installation-owned' || record.kind === 'local-only') return false
+    if (record.outdated) return true
+    return record.latest === undefined
+  }, [])
+
   return (
     <div className={css.section}>
       <h2 className={css.heading} title={t('title')}>{t('title')}</h2>
@@ -133,7 +142,8 @@ export function UpdaterSection(props: UpdaterSectionProps): React.ReactNode {
                       <button
                         type="button"
                         className={css.button}
-                        disabled={row?.running === true || record.kind === 'installation-owned' || record.kind === 'local-only'}
+                        disabled={row?.running === true || !canUpdate(record)}
+                        title={!canUpdate(record) && !row?.running ? t('updateDisabled') : undefined}
                         onClick={() => { void runOne(record) }}
                       >
                         {row?.running === true ? t('running') : t('update')}
@@ -142,8 +152,8 @@ export function UpdaterSection(props: UpdaterSectionProps): React.ReactNode {
                         <button
                           type="button"
                           className={css.button}
-                          disabled={row?.running === true}
-                          title={t('updateStashHint')}
+                          disabled={row?.running === true || !canUpdate(record)}
+                          title={!canUpdate(record) && !row?.running ? t('updateDisabled') : t('updateStashHint')}
                           onClick={() => { void runOne(record, true) }}
                         >
                           {row?.running === true ? t('running') : t('updateStash')}
