@@ -54,8 +54,11 @@ they never run pnpm in one profile at the same time.
 
 ## Compatibility
 
-- DSH `>=0.2.0-rc.1 <0.3.0` (declared as `engines.dsh`; DSH checks it at
-  install and boot). For DSH 0.1.x use dsh-updater 0.1.x.
+- DSH `>=0.2.0-rc.1` (declared as `engines.dsh`; DSH checks it at install
+  and boot). No upper bound on purpose: a future DSH major is not refused
+  up front, so if 0.3 breaks a contract this plugin relies on, the failure
+  shows up at boot rather than as a refused install. For DSH 0.1.x use
+  dsh-updater 0.1.x.
 - Node ≥ 24.9 is what DSH 0.2 itself requires; the plugin only needs Node 22+.
 - The panel lives inside the Plugins settings section, which the default
   `dsh-web-app` composition always mounts. A custom composition without

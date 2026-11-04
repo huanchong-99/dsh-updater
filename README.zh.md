@@ -50,8 +50,10 @@ DSH 0.2 自带的 **插件** 页面可以安装、卸载和更新 bundle，但�
 
 ## 兼容性
 
-- DSH `>=0.2.0-rc.1 <0.3.0`（通过 `engines.dsh` 声明，DSH 在安装和启动时校
-  验）。DSH 0.1.x 请使用 dsh-updater 0.1.x。
+- DSH `>=0.2.0-rc.1`（通过 `engines.dsh` 声明，DSH 在安装和启动时校验）。
+  有意不设上限：未来的 DSH 大版本不会被预先拒绝；若 0.3 改了本插件依赖的契
+  约，问题会在启动时暴露，而不是表现为安装被拒。DSH 0.1.x 请使用
+  dsh-updater 0.1.x。
 - DSH 0.2 自身要求 Node ≥ 24.9；本插件只需要 Node 22+。
 - 面板挂在「插件」设置分区的标签页里，默认的 `dsh-web-app` 组合始终包含该分
   区。若自定义组合去掉了 `@deepseek-ai/dsh-client-ui-settings-plugins`，标签
