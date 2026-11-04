@@ -58,9 +58,8 @@
 }
 
 .name {
-  margin-top: 2px;
-  color: var(--color-text-secondary, #888);
-  font-size: 11px;
+  font-weight: 600;
+  font-size: 12px;
   word-break: break-all;
 }
 
@@ -145,4 +144,54 @@
   border: 1px solid var(--color-border, #333);
   border-radius: 6px;
   padding: 6px;
+}
+
+.meta {
+  display: inline-flex;
+  gap: 12px;
+  margin-left: auto;
+  color: var(--color-text-secondary, #888);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.groupRow th {
+  padding-top: 14px;
+  font-size: 12px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--color-border, #333);
+}
+
+.groupCount {
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border, #333);
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--color-text-secondary, #888);
+}
+
+.sub {
+  margin-top: 2px;
+  font-family: inherit;
+  font-size: 10px;
+  color: var(--color-text-secondary, #888);
+}
+
+.ok {
+  color: #3fb950;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.details {
+  margin-top: 4px;
+}
+
+.details summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--color-text-secondary, #888);
 }

@@ -1,8 +1,10 @@
 /**
  * dsh-updater update executors. Each source kind has exactly one executor:
  *  - git-clone:  git pull --ff-only + package-manager install + build
- *  - npm:        pnpm update --latest (with the pnpm 11 minimumReleaseAge
- *                gate overridden) + post-run version-movement verification
+ *  - npm:        pnpm add <name>@<candidate> --save-exact (the same shape
+ *                `dsh plugin` and the built-in Plugins page write, so the
+ *                profile keeps exact pins), with the pnpm 11
+ *                minimumReleaseAge gate overridden, under the profile lock
  *  - pnpm-git:   re-add the original git spec so pnpm re-resolves the ref
  *  - installation-owned / local-only: refused with a structured error code
  *
@@ -15,19 +17,18 @@ import { existsSync, readFileSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
-  compareVersions,
   fetchLatestCommit,
   readGitInfo,
   readPackageVersion,
   resolveInstalledDir,
 } from './inventory.ts'
+import { ProfileLockError, withProfileLock } from './lock.ts'
+
+export { NPM_REGISTRY } from './registry.ts'
 
 // ---------------------------------------------------------------------------
 // Async command runner
 // ---------------------------------------------------------------------------
-
-/** npm registry base used for version probes. */
-export const NPM_REGISTRY = 'https://registry.npmjs.org'
 
 /** Structured failure codes the browser half translates. */
 export type UpdateErrorCode =
@@ -38,9 +39,12 @@ export type UpdateErrorCode =
   | 'manager-missing'
   | 'manager-failed'
   | 'build-failed'
+  | 'build-blocked'
   | 'timeout'
   | 'pnpm-missing'
   | 'pnpm-failed'
+  | 'profile-locked'
+  | 'busy'
   | 'stale'
   | 'verify-failed'
   | 'not-found'
@@ -75,24 +79,36 @@ export interface RunCommandOptions {
   env?: NodeJS.ProcessEnv
 }
 
+/** Outcome of one spawned command. */
+export interface CommandOutcome {
+  code: number | null
+  output: string
+  /** False when the process never started (ENOENT, EACCES...). */
+  started: boolean
+  /** True when the hard timeout killed a running process. */
+  timedOut: boolean
+}
+
 /**
  * Run one command to completion and collect bounded stdout+stderr.
- * @returns exit code, captured output, and whether the process ever started.
+ * @returns exit code, captured output, whether the process ever started, and
+ *   whether the timeout killed it.
  */
 export function runCommand(
   command: string,
   args: string[],
   options: RunCommandOptions,
-): Promise<{ code: number | null; output: string; started: boolean }> {
+): Promise<CommandOutcome> {
   return new Promise((resolve) => {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     let output = ''
     let settled = false
+    let timedOut = false
     const finish = (code: number | null, started: boolean): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      resolve({ code, output: capOutput(output), started })
+      resolve({ code, output: capOutput(output), started, timedOut })
     }
     const spawnOptions: Record<string, unknown> = {
       cwd: options.cwd,
@@ -102,6 +118,7 @@ export function runCommand(
     }
     const timer = setTimeout(() => {
       if (settled) return
+      timedOut = true
       if (process.platform === 'win32') {
         const pid = (child as { pid?: number } | undefined)?.pid
         if (pid !== undefined && pid > 0) {
@@ -114,7 +131,7 @@ export function runCommand(
       } else {
         child?.kill('SIGTERM')
       }
-      finish(null, false)
+      finish(null, true)
     }, timeoutMs)
     const child = spawn(command, args, spawnOptions)
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -135,11 +152,20 @@ export function runCommand(
 /** Windows cmd command-not-found stderr. */
 const WIN_CMD_MISSING_RE = /not recognized as an internal or external command/i
 
+/** pnpm ≥10 refusing a dependency's lifecycle script until it is allow-listed. */
+const BUILD_BLOCKED_RE = /allowBuilds|approve-builds|Ignored build scripts|ERR_PNPM_IGNORED_BUILDS|ERR_PNPM_GIT_PREPARE/i
+
+/** Whether pnpm output says a build script was blocked by the allowBuilds policy. */
+export function detectBuildBlocked(output: string): boolean {
+  return BUILD_BLOCKED_RE.test(output)
+}
+
 /**
  * Run a command with an ordered fallback chain for package managers. Each
  * candidate is tried only when the previous one is missing on PATH (ENOENT,
- * or Windows' exit-1 "not recognized" stderr). Output accumulates across
- * candidates; one hard timeout covers the whole chain.
+ * or Windows' exit-1 "not recognized" stderr). A timeout ends the chain at
+ * once — re-running the same slow command through the next manager would only
+ * multiply the wait. Output accumulates across candidates.
  */
 export async function runWithManagerFallback(
   candidates: ReadonlyArray<{ command: string; args: string[] }>,
@@ -149,6 +175,15 @@ export async function runWithManagerFallback(
   for (const candidate of candidates) {
     const result = await runCommand(candidate.command, candidate.args, options)
     output += result.output
+    if (result.timedOut) {
+      return {
+        ok: false,
+        exitCode: null,
+        output: capOutput(output),
+        error: candidate.command + ' timed out after ' + String(Math.round((options.timeoutMs ?? DEFAULT_TIMEOUT_MS) / 1000)) + 's',
+        errorCode: 'timeout',
+      }
+    }
     if (!result.started) {
       // Missing command on POSIX or a non-spawnable child; try the next one.
       continue
@@ -165,43 +200,15 @@ export async function runWithManagerFallback(
       exitCode: result.code,
       output: capOutput(output),
       error: candidate.command + ' exited with code ' + String(result.code),
-      errorCode: 'manager-failed',
+      errorCode: detectBuildBlocked(result.output) ? 'build-blocked' : 'manager-failed',
     }
   }
   return {
     ok: false,
     exitCode: null,
     output: capOutput(output),
-    error: 'no package manager found on PATH (tried pnpm, corepack, npx)',
+    error: 'no package manager found on PATH (tried ' + candidates.map(candidate => candidate.command).join(', ') + ')',
     errorCode: 'pnpm-missing',
-  }
-}
-
-// ---------------------------------------------------------------------------
-// npm registry probe
-// ---------------------------------------------------------------------------
-
-/** Fetch the latest npm version for one package; undefined on any failure. */
-export async function fetchLatestVersion(
-  name: string,
-  fetchImpl: (url: string) => Promise<{ ok: boolean; json(): Promise<unknown> }>,
-  timeoutMs = 10_000,
-): Promise<string | undefined> {
-  try {
-    const controller = new AbortController()
-    const timer = setTimeout(() => { controller.abort() }, timeoutMs)
-    try {
-      const response = await fetchImpl(NPM_REGISTRY + '/' + name.replace('/', '%2F') + '/latest')
-      if (!response.ok) return undefined
-      const body = await response.json()
-      if (typeof body !== 'object' || body === null) return undefined
-      const version = (body as Record<string, unknown>).version
-      return typeof version === 'string' ? version : undefined
-    } finally {
-      clearTimeout(timer)
-    }
-  } catch {
-    return undefined
   }
 }
 
@@ -218,6 +225,12 @@ export interface UpdateTarget {
   spec: string
   dir?: string
   gitRoot?: string
+  /**
+   * For `npm`: the exact version to install (the admitted candidate the
+   * status probe selected). Absent when the probe could not reach the
+   * registry; the executor then falls back to `pnpm update --latest`.
+   */
+  version?: string
   /**
    * How a dirty git-clone work tree is handled. `false` (the default)
    * refuses the update; `true` runs `git pull --ff-only --autostash` so
@@ -236,6 +249,18 @@ function pnpmCandidates(args: string[]): ReadonlyArray<{ command: string; args: 
     { command: 'corepack', args: ['pnpm', ...args] },
     { command: 'npx', args: ['--yes', 'pnpm', ...args] },
   ]
+}
+
+/**
+ * Characters that must never reach a package-manager argument. On Windows the
+ * .cmd shims force `shell: true`, where these would be interpreted by cmd.exe;
+ * valid npm names, semver versions, and git specs never contain them.
+ */
+const UNSAFE_ARGUMENT_RE = /[\s"'`&|<>^$;(){}\\]|^-/
+
+/** Whether a value is safe to pass to pnpm/git as one argument. */
+export function isSafeArgument(value: string): boolean {
+  return value !== '' && !UNSAFE_ARGUMENT_RE.test(value)
 }
 
 /** Read a package.json as an object, or undefined on any failure. */
@@ -283,10 +308,12 @@ export async function reconcileProfileBundles(profileDir: string): Promise<void>
     }
     const dependencySet = new Set(Object.keys(dependencies))
     for (const name of [...next]) {
-      const wasDependency = dependencySet.has(name) || plugins.includes(name)
+      // Only out-of-tree dependencies are reconciled: in-box bundles
+      // (dsh-base, dsh-web-app...) resolve from the installation and stay.
+      if (!dependencySet.has(name)) continue
       const dir = resolveInstalledDir(profileDir, name)
       const stillBundle = declaresBundle(dir === undefined ? undefined : readManifestObject(join(dir, 'package.json')))
-      if (wasDependency && !stillBundle) {
+      if (!stillBundle) {
         next.splice(next.indexOf(name), 1)
         changed = true
       }
@@ -314,25 +341,27 @@ export async function reconcileProfileBundles(profileDir: string): Promise<void>
 export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunResult> {
   const root = target.gitRoot ?? target.dir
   if (root === undefined) return notFoundResult('git root missing')
+  const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
 
   // Dirty check: never overwrite local edits with an update. Only the
   // explicit per-row stash action may bypass this via --autostash.
-  const dirtyProbe = await runCommand('git', ['-C', root, 'status', '--porcelain'], { cwd: root })
+  const dirtyProbe = await runCommand('git', ['-C', root, 'status', '--porcelain'], { cwd: root, env: gitEnv })
   if (!dirtyProbe.started || dirtyProbe.code !== 0) {
     return { ok: false, exitCode: dirtyProbe.code, output: dirtyProbe.output, error: 'git status failed', errorCode: 'git-failed' }
   }
   const isDirty = dirtyProbe.output.trim() !== ''
 
-  let pull: { code: number | null; output: string; started: boolean }
+  let pull: CommandOutcome
   if (isDirty && target.autostash === true) {
-    pull = await runCommand('git', ['-C', root, 'pull', '--ff-only', '--autostash'], { cwd: root })
+    pull = await runCommand('git', ['-C', root, 'pull', '--ff-only', '--autostash'], { cwd: root, env: gitEnv })
+    if (pull.timedOut) return timeoutResult('git pull', pull.output)
     if (pull.code !== 0) {
       return { ok: false, exitCode: pull.code, output: pull.output, error: 'git pull --ff-only --autostash failed', errorCode: 'git-failed' }
     }
     // `git pull --autostash` exits 0 even when re-applying the stash hit a
     // conflict; the tree is left conflicted and the stash is kept. Never
     // install/build over that state.
-    const unmerged = await runCommand('git', ['-C', root, 'diff', '--name-only', '--diff-filter=U'], { cwd: root })
+    const unmerged = await runCommand('git', ['-C', root, 'diff', '--name-only', '--diff-filter=U'], { cwd: root, env: gitEnv })
     if (unmerged.code !== 0) {
       return { ok: false, exitCode: unmerged.code, output: capOutput(pull.output + '\n' + unmerged.output), error: 'git autostash conflict probe failed', errorCode: 'git-failed' }
     }
@@ -348,7 +377,8 @@ export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunRes
   } else if (isDirty) {
     return { ok: false, exitCode: null, output: dirtyProbe.output, error: 'git work tree has uncommitted changes; commit or stash them first', errorCode: 'git-dirty' }
   } else {
-    pull = await runCommand('git', ['-C', root, 'pull', '--ff-only'], { cwd: root })
+    pull = await runCommand('git', ['-C', root, 'pull', '--ff-only'], { cwd: root, env: gitEnv })
+    if (pull.timedOut) return timeoutResult('git pull', pull.output)
     if (pull.code !== 0) {
       return { ok: false, exitCode: pull.code, output: pull.output, error: 'git pull --ff-only failed', errorCode: 'git-failed' }
     }
@@ -365,33 +395,52 @@ export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunRes
   } else {
     install = await runWithManagerFallback([{ command: 'npm', args: ['install'] }], { cwd: root })
   }
-  if (!install.ok) return install
+  if (!install.ok) return { ...install, output: capOutput(pull.output + '\n' + install.output) }
 
   if (!hasBuild) {
-    return { ok: true, exitCode: 0, output: capOutput(install.output + '\n(no build script; install complete)') }
+    return { ok: true, exitCode: 0, output: capOutput(pull.output + '\n' + install.output + '\n(no build script; install complete)') }
   }
   const buildCommand = existsSync(join(root, 'pnpm-lock.yaml')) ? 'pnpm' : existsSync(join(root, 'yarn.lock')) ? 'yarn' : 'npm'
   const build = await runCommand(buildCommand, ['run', 'build'], { cwd: root })
+  if (build.timedOut) return timeoutResult(buildCommand + ' run build', pull.output + '\n' + install.output + '\n' + build.output)
   if (build.code !== 0) {
-    return { ok: false, exitCode: build.code, output: capOutput(install.output + '\n' + build.output), error: buildCommand + ' run build failed', errorCode: 'build-failed' }
+    return { ok: false, exitCode: build.code, output: capOutput(pull.output + '\n' + install.output + '\n' + build.output), error: buildCommand + ' run build failed', errorCode: 'build-failed' }
   }
-  return { ok: true, exitCode: 0, output: capOutput(install.output + '\n' + build.output) }
+  return { ok: true, exitCode: 0, output: capOutput(pull.output + '\n' + install.output + '\n' + build.output) }
+}
+
+/** Run one pnpm operation inside the profile under the shared profile lock. */
+async function runPnpmInProfile(target: UpdateTarget, args: string[]): Promise<UpdateRunResult> {
+  try {
+    return await withProfileLock(target.profileDir, async () => {
+      const result = await runWithManagerFallback(pnpmCandidates(args), { cwd: target.profileDir })
+      if (result.ok) await reconcileProfileBundles(target.profileDir)
+      return result
+    })
+  } catch (error) {
+    if (error instanceof ProfileLockError) {
+      return { ok: false, exitCode: null, output: '', error: error.message, errorCode: 'profile-locked' }
+    }
+    throw error
+  }
 }
 
 /**
- * Update an npm dependency: run `pnpm update --latest` (with the
- * minimumReleaseAge gate overridden) inside the owning profile, falling back
- * through corepack and npx. `--latest` is required because dsh plugin writes
- * exact-version specs, which plain `pnpm update` treats as pinned.
+ * Update an npm dependency inside the owning profile. With a selected
+ * candidate: `pnpm add <name>@<version> --save-exact` — the exact-pin shape
+ * `dsh plugin add` and the built-in Plugins page write. Without one (registry
+ * unreachable during the probe): `pnpm update --latest` with save-exact
+ * configured, because dsh writes exact specs that plain `pnpm update` treats
+ * as pinned. Both override the pnpm 11 minimumReleaseAge gate.
  */
 export async function updateNpmPackage(target: UpdateTarget): Promise<UpdateRunResult> {
-  const result = await runWithManagerFallback(
-    pnpmCandidates(['update', '--latest', MIN_RELEASE_AGE_OVERRIDE, target.name]),
-    { cwd: target.profileDir },
-  )
-  if (!result.ok) return result
-  await reconcileProfileBundles(target.profileDir)
-  return result
+  if (!isSafeArgument(target.name) || (target.version !== undefined && !isSafeArgument(target.version))) {
+    return { ok: false, exitCode: null, output: '', error: 'package name or version contains unsafe characters', errorCode: 'unsupported' }
+  }
+  const args = target.version === undefined
+    ? ['update', '--latest', '--config.save-exact=true', MIN_RELEASE_AGE_OVERRIDE, target.name]
+    : ['add', `${target.name}@${target.version}`, '--save-exact', MIN_RELEASE_AGE_OVERRIDE]
+  return runPnpmInProfile(target, args)
 }
 
 /**
@@ -400,13 +449,10 @@ export async function updateNpmPackage(target: UpdateTarget): Promise<UpdateRunR
  * re-resolved (no-op when the commit did not change).
  */
 export async function updatePnpmGitPackage(target: UpdateTarget): Promise<UpdateRunResult> {
-  const result = await runWithManagerFallback(
-    pnpmCandidates(['add', target.spec, MIN_RELEASE_AGE_OVERRIDE]),
-    { cwd: target.profileDir },
-  )
-  if (!result.ok) return result
-  await reconcileProfileBundles(target.profileDir)
-  return result
+  if (!isSafeArgument(target.spec)) {
+    return { ok: false, exitCode: null, output: '', error: 'dependency spec contains unsafe characters', errorCode: 'unsupported' }
+  }
+  return runPnpmInProfile(target, ['add', target.spec, MIN_RELEASE_AGE_OVERRIDE])
 }
 
 /** Dispatch one update target to its executor. */
@@ -419,43 +465,49 @@ export async function runTargetUpdate(target: UpdateTarget): Promise<UpdateRunRe
       ok: false,
       exitCode: null,
       output: '',
-      error: `kind ${target.kind} cannot be updated from the panel`,
+      error: `kind ${String((target as { kind: unknown }).kind)} cannot be updated from the panel`,
       errorCode: 'unsupported',
     }
   }
 }
 
-/** Verify that an npm update actually moved the installed version. */
-export async function verifyNpmUpdate(
+/**
+ * Verify that an npm update landed. With a known target version the
+ * installed manifest must now carry exactly that version; otherwise any
+ * movement (or a first-time resolution) counts, and an unchanged version is
+ * reported as a no-op rather than a failure.
+ */
+export function verifyNpmUpdate(
   profileDir: string,
   name: string,
   before: string | undefined,
-  fetchImpl: (url: string) => Promise<{ ok: boolean; json(): Promise<unknown> }>,
-): Promise<UpdateRunResult> {
+  expected: string | undefined,
+): UpdateRunResult {
   const dir = resolveInstalledDir(profileDir, name)
   const after = dir === undefined ? undefined : readPackageVersion(dir)
-  const moved = before !== undefined && after !== undefined && after !== before
-  if (moved) return { ok: true, exitCode: 0, output: '' }
-  const latest = await fetchLatestVersion(name, fetchImpl)
-  if (latest !== undefined && after !== undefined && compareVersions(latest, after) <= 0) {
-    return { ok: true, exitCode: 0, output: '(already up to date)' }
-  }
-  if (latest !== undefined && after !== undefined && compareVersions(latest, after) > 0) {
+  if (expected !== undefined) {
+    if (after === expected) return { ok: true, exitCode: 0, output: `${name}@${after}` }
     return {
       ok: false,
       exitCode: 0,
       output: '',
-      error: 'pnpm exited 0 but the installed version did not change (minimumReleaseAge gate?)',
+      error: `pnpm exited 0 but ${name} is ${after ?? 'unresolvable'} instead of ${expected} (minimumReleaseAge gate or registry mismatch?)`,
       errorCode: 'stale',
     }
   }
-  return {
-    ok: false,
-    exitCode: 0,
-    output: '',
-    error: 'update finished but the post-run version check could not verify the install',
-    errorCode: 'verify-failed',
+  if (after === undefined) {
+    return {
+      ok: false,
+      exitCode: 0,
+      output: '',
+      error: 'update finished but the installed package is not resolvable',
+      errorCode: 'verify-failed',
+    }
   }
+  if (before !== undefined && after === before) {
+    return { ok: true, exitCode: 0, output: `(version unchanged: ${name}@${after})` }
+  }
+  return { ok: true, exitCode: 0, output: `${name}@${after}` }
 }
 
 /** Shared not-found result. */
@@ -463,8 +515,13 @@ function notFoundResult(detail: string): UpdateRunResult {
   return { ok: false, exitCode: null, output: '', error: detail, errorCode: 'not-found' }
 }
 
+/** Shared timeout result. */
+function timeoutResult(what: string, output: string): UpdateRunResult {
+  return { ok: false, exitCode: null, output: capOutput(output), error: what + ' timed out', errorCode: 'timeout' }
+}
+
 /** Read the latest git commit for an update target (network probe). */
-export function latestGitCommit(target: UpdateTarget, remoteOverride?: string, refOverride?: string): string | undefined {
+export async function latestGitCommit(target: UpdateTarget, remoteOverride?: string, refOverride?: string): Promise<string | undefined> {
   if (remoteOverride !== undefined) {
     return fetchLatestCommit(remoteOverride, refOverride)
   }

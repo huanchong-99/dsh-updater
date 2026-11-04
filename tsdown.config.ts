@@ -11,9 +11,11 @@
  *     modules through the loader's frozen module table, and inlines CSS
  *     Modules (compiled by lightningcss, injected as a `<style data-plugin>`).
  *
- * The externals list mirrors the client platform module table plus the
- * documented `@deepseek-ai/dsh-client-runtime/client` store exemption. Every
- * other `@deepseek-ai/*` value import is a build error (purity gate).
+ * The externals list mirrors the DSH 0.2.x client platform module table
+ * (`@deepseek-ai/dsh-client-web/src/platform.ts`). Every other
+ * `@deepseek-ai/*` value import is a build error (purity gate): the module
+ * table answers only these words, so anything else would be a runtime
+ * `require` miss inside the browser.
  */
 import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
@@ -25,25 +27,31 @@ import { transform } from 'lightningcss'
 /** Stable plugin id: must equal the package name. */
 const PACKAGE_ID = 'dsh-updater'
 
-/** Platform modules the shell shares into the frozen module table. */
+/**
+ * Platform modules the shell shares into the frozen module table (DSH 0.2.x).
+ * Keep in sync with `@deepseek-ai/dsh-client-web/src/platform.ts`.
+ */
 const PLATFORM_MODULES = [
   'react',
   'react/jsx-runtime',
   'react-dom',
   'react-dom/client',
   '@deepseek-ai/cordis',
+  'zod',
+  '@tanstack/react-virtual',
+  '@deepseek-ai/dsh-client-store',
   '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-web-react',
   '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-ui-attachment',
-  '@deepseek-ai/dsh-client-schema-form',
+  '@deepseek-ai/dsh-client-ui-dockkit',
 ] as const
 
-/** Documented lazy-CJS exemption (runtime snapshot-store engine). */
-const RUNTIME_STORE_EXEMPTION = '@deepseek-ai/dsh-client-runtime/client'
-
-/** Specifiers resolved from the loader module table at bundle load time. */
-const CLIENT_EXTERNALS: string[] = [...PLATFORM_MODULES, RUNTIME_STORE_EXEMPTION]
+/**
+ * Specifiers resolved from the loader module table at bundle load time. The
+ * plugin declares no `dsh.client.external` requests, so the baseline is the
+ * whole list; the only value imports this bundle actually makes are `react`
+ * and `react/jsx-runtime`.
+ */
+const CLIENT_EXTERNALS: string[] = [...PLATFORM_MODULES]
 
 const REPOSITORY_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
@@ -83,6 +91,12 @@ export default defineConfig(() => [
     fixedExtension: false,
     dts: false,
     clean: true,
+    deps: {
+      // The host half keeps zero runtime dependencies: the only third-party
+      // library it uses (semver, for DSH's engines/peer admission rule) is
+      // inlined, so a git / tarball install needs nothing beyond the build.
+      alwaysBundle: ['semver'],
+    },
   },
   {
     // Browser half: served at /plugins/<PACKAGE_ID>/client.js.

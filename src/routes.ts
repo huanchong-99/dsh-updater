@@ -2,11 +2,12 @@
  * The /api/plugin-updater route family: the status probe and the update run.
  * Both are loopback-only control surfaces — the run endpoint triggers a real
  * git pull / pnpm install on this machine, so it must never be reachable
- * from a LAN or phone origin.
+ * from a LAN or phone origin, even though DSH 0.2.x can serve the Web UI on a
+ * network address or behind a trusted reverse proxy.
  *
- * The trust fence is self-contained (re-implemented from the documented
- * Host/Origin semantics); this package does not depend on any third-party
- * plugin package.
+ * The trust fence is self-contained (the documented Host/Origin semantics of
+ * DSH's own /api fence, plus a loopback *socket* requirement on top); this
+ * package does not depend on any third-party plugin package.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -38,7 +39,7 @@ export interface RunRequestBody {
 export interface UpdaterRoutesDeps {
   /** Loopback-only fence: control endpoints are host-surface only. */
   fence(request: IncomingMessage): boolean
-  /** Read the current scan (local disk + git probes only). */
+  /** Read the current scan (local disk + network probes). */
   status(): Promise<UpdaterStatus>
   /** Resolve a concrete update target for one record. */
   resolveTarget(record: PluginRecord): UpdateTarget | undefined
@@ -78,31 +79,49 @@ function isLoopbackHostname(hostname: string): boolean {
   return isIPv4Loopback(hostname)
 }
 
+/** Parse a bare `host[:port]` authority under a scheme; undefined when unparsable. */
+function parseAuthority(authority: string, scheme: 'http:' | 'https:'): URL | undefined {
+  try {
+    return new URL(`${scheme}//${authority}`)
+  } catch {
+    return undefined
+  }
+}
+
+/** Minimal request facts the fence reads (test seam). */
+export interface TrustRequestLike {
+  socket?: { remoteAddress?: string }
+  headers: Record<string, string | string[] | undefined>
+}
+
 /**
  * Browser-trust fence for the /api/plugin-updater routes: a loopback socket
  * address AND a loopback Host header, plus browser same-origin markers.
- * X-Forwarded-For is never trusted.
+ * X-Forwarded-For is never trusted, so a reverse proxy in front of DSH does
+ * not open these routes to its clients. The Origin, when present, is compared
+ * under its own scheme so default ports (`:80`, `:443`) normalize the same
+ * way on both sides whether the listener speaks HTTP or TLS.
  */
-export function isTrustedUpdaterRequest(request: IncomingMessage): boolean {
-  const socket = request.socket as { remoteAddress?: string } | undefined
-  if (!isLoopbackAddress(socket?.remoteAddress)) return false
+export function isTrustedUpdaterRequest(request: TrustRequestLike): boolean {
+  if (!isLoopbackAddress(request.socket?.remoteAddress)) return false
   const host = request.headers.host
   if (typeof host !== 'string') return false
-  let hostUrl: URL
-  try {
-    hostUrl = new URL('http://' + host)
-  } catch {
-    return false
-  }
-  if (!isLoopbackHostname(hostUrl.hostname)) return false
+  const hostUrl = parseAuthority(host, 'http:')
+  if (hostUrl === undefined || !isLoopbackHostname(hostUrl.hostname)) return false
   if (request.headers['sec-fetch-site'] === 'cross-site') return false
   const origin = request.headers.origin
   if (origin === undefined) return true
+  if (typeof origin !== 'string') return false
+  let originUrl: URL
   try {
-    return new URL(origin).host === hostUrl.host
+    originUrl = new URL(origin)
   } catch {
     return false
   }
+  const scheme = originUrl.protocol === 'https:' ? 'https:' : originUrl.protocol === 'http:' ? 'http:' : undefined
+  if (scheme === undefined) return false
+  const hostUnderScheme = parseAuthority(host, scheme)
+  return hostUnderScheme !== undefined && originUrl.host === hostUnderScheme.host
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +131,11 @@ export function isTrustedUpdaterRequest(request: IncomingMessage): boolean {
 /** One JSON response. */
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'referrer-policy': 'no-referrer' })
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+  })
   res.end(payload)
 }
 
@@ -135,11 +158,15 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the /api/plugin-updater route family.
+ * Build the /api/plugin-updater route family. One update run at a time: a
+ * second POST while a run is in flight answers 409 instead of starting a
+ * concurrent pnpm/git process in the same profile.
  * @param deps - fence + status/resolve/run seams.
  * @returns the exact routes to register on webServer.
  */
 export function makeUpdaterRoutes(deps: UpdaterRoutesDeps): WebRoute[] {
+  let running = false
+
   const handleStatus = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method !== 'GET') {
       res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
@@ -150,7 +177,12 @@ export function makeUpdaterRoutes(deps: UpdaterRoutesDeps): WebRoute[] {
       writeJson(res, 403, { ok: false, code: 'forbidden' })
       return
     }
-    writeJson(res, 200, await deps.status())
+    try {
+      const status = await deps.status()
+      writeJson(res, 200, { ...status, busy: running })
+    } catch (error) {
+      writeJson(res, 500, { ok: false, code: 'internal-error', error: error instanceof Error ? error.message : String(error) })
+    }
   }
 
   const handleRun = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -174,12 +206,18 @@ export function makeUpdaterRoutes(deps: UpdaterRoutesDeps): WebRoute[] {
       writeJson(res, 400, { ok: false, code: 'bad-request' })
       return
     }
-    const request = body as RunRequestBody
+    if (running) {
+      writeJson(res, 409, { ok: false, code: 'busy' })
+      return
+    }
+    running = true
     try {
-      const result = await runRequested(deps, request)
+      const result = await runRequested(deps, body as RunRequestBody)
       writeJson(res, 200, result)
     } catch (error) {
       writeJson(res, 500, { ok: false, code: 'internal-error', error: error instanceof Error ? error.message : String(error) })
+    } finally {
+      running = false
     }
   }
 
@@ -195,7 +233,7 @@ export function makeUpdaterRoutes(deps: UpdaterRoutesDeps): WebRoute[] {
  *  - `{ profile, all: true }` — update every outdated package in a profile
  *  - `{ all: true }` — update every outdated package across profiles
  */
-async function runRequested(deps: UpdaterRoutesDeps, request: RunRequestBody): Promise<UpdateRunResult> {
+export async function runRequested(deps: UpdaterRoutesDeps, request: RunRequestBody): Promise<UpdateRunResult> {
   const status = await deps.status()
   const options: UpdateRunOptions = { autostash: request.autostash === true }
   let records = status.records
@@ -225,7 +263,7 @@ async function runRequested(deps: UpdaterRoutesDeps, request: RunRequestBody): P
         seenGitRoots.add(target.gitRoot)
       }
       const result = await deps.run(target, options)
-      combined += result.output
+      combined += `== ${record.profile} / ${record.name}\n${result.output}\n`
       if (!result.ok) return { ...result, output: combined }
     }
     return { ok: true, exitCode: 0, output: combined }

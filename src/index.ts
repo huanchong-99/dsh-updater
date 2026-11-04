@@ -1,9 +1,9 @@
 /**
  * dsh-updater — Node (host) half.
  *
- * Standalone plugin-update surface for DSH. Scans every profile dependency,
- * classifies its source (installation-owned / npm / git-clone / pnpm-git /
- * local-only), and exposes two loopback-only routes:
+ * Standalone plugin-update surface for DSH 0.2.x. Scans every profile
+ * dependency, classifies its source (installation-owned / npm / git-clone /
+ * pnpm-git / local-only), and exposes two loopback-only routes:
  *   GET  /api/plugin-updater/status
  *   POST /api/plugin-updater/run
  *
@@ -21,8 +21,8 @@ import {
   type PluginRecord,
   type UpdaterStatus,
 } from './inventory.ts'
+import { probeNpmCandidate } from './registry.ts'
 import {
-  fetchLatestVersion,
   latestGitCommit,
   runTargetUpdate,
   verifyNpmUpdate,
@@ -36,6 +36,24 @@ export const name = 'dsh-updater'
 
 /** Required host service: the web server route registry. */
 export const inject = ['webServer']
+
+/** How many registry / git probes run at once during one status read. */
+const PROBE_CONCURRENCY = 6
+
+/** Map with a concurrency cap, preserving order. */
+async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array<R>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next++
+      if (index >= items.length) return
+      results[index] = await fn(items[index])
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
 
 /**
  * Resolve one scanned record into a concrete update target, or undefined
@@ -63,6 +81,8 @@ function resolveTarget(record: PluginRecord): UpdateTarget | undefined {
         kind: 'npm',
         spec: record.spec,
         dir: record.dir,
+        // The admitted candidate the probe selected; the executor pins it.
+        version: record.outdated ? record.latest : undefined,
       }
     case 'pnpm-git':
       return {
@@ -79,22 +99,31 @@ function resolveTarget(record: PluginRecord): UpdateTarget | undefined {
 }
 
 /**
- * Full status: local scan + network probes. Network failures degrade to
- * per-row `latest: undefined` rather than failing the whole status call.
+ * Full status: local scan + network probes (bounded concurrency). Network
+ * failures degrade to per-row `latest: undefined` rather than failing the
+ * whole status call.
  */
 async function readStatus(): Promise<UpdaterStatus> {
   const status = scanProfiles()
-  const records = await Promise.all(status.records.map(async (record): Promise<PluginRecord> => {
+  const profileDirs = new Map(listProfileDirs().map(entry => [entry.name, entry.dir]))
+  const records = await mapLimit(status.records, PROBE_CONCURRENCY, async (record): Promise<PluginRecord> => {
     if (record.kind === 'npm') {
-      const latest = await fetchLatestVersion(record.name, fetch)
-      const outdated = latest !== undefined
-        && record.current !== undefined
-        && compareVersions(latest, record.current) > 0
-      return { ...record, latest, outdated }
+      const profileDir = profileDirs.get(record.profile)
+      if (profileDir === undefined) return record
+      const candidate = await probeNpmCandidate(record.name, record.current, {
+        profileDir,
+        dshVersion: status.dshVersion,
+        fetchImpl: fetch,
+      })
+      // Registry unreachable: leave `latest` unknown so the row stays actionable.
+      if (candidate === undefined) return { ...record, latest: undefined, outdated: false }
+      const outdated = candidate.latest !== undefined
+        && (record.current === undefined || compareVersions(candidate.latest, record.current) > 0)
+      return { ...record, latest: candidate.latest ?? record.current, incompatibleLatest: candidate.incompatibleLatest, outdated }
     }
     if (record.kind === 'git-clone') {
       const target = resolveTarget(record)
-      const latest = target === undefined ? undefined : latestGitCommit(target)
+      const latest = target === undefined ? undefined : await latestGitCommit(target)
       const outdated = latest !== undefined && record.current !== undefined && latest !== record.current
       return { ...record, latest, outdated }
     }
@@ -105,12 +134,12 @@ async function readStatus(): Promise<UpdaterStatus> {
       const target = resolveTarget(record)
       const remote = record.git?.remote
       const ref = record.git?.branch
-      const latest = target === undefined ? undefined : latestGitCommit(target, remote, ref)
+      const latest = target === undefined ? undefined : await latestGitCommit(target, remote, ref)
       const outdated = latest !== undefined && record.current !== undefined && latest !== record.current
       return { ...record, latest, outdated }
     }
     return record
-  }))
+  })
   return { ...status, records }
 }
 
@@ -127,12 +156,11 @@ export function apply(ctx: Context): void {
       run: async (target: UpdateTarget, options?: UpdateRunOptions): Promise<UpdateRunResult> => {
         const effectiveTarget = options?.autostash === true ? { ...target, autostash: true } : target
         if (effectiveTarget.kind === 'npm') {
-          const profile = listProfileDirs().find(entry => entry.name === effectiveTarget.profile)
           const before = effectiveTarget.dir === undefined ? undefined : readPackageVersion(effectiveTarget.dir)
           const result = await runTargetUpdate(effectiveTarget)
           if (!result.ok) return result
-          if (profile === undefined) return result
-          return verifyNpmUpdate(profile.dir, effectiveTarget.name, before, fetch)
+          const verified = verifyNpmUpdate(effectiveTarget.profileDir, effectiveTarget.name, before, effectiveTarget.version)
+          return { ...verified, output: [result.output, verified.output].filter(part => part !== '').join('\n') }
         }
         return runTargetUpdate(effectiveTarget)
       },
@@ -146,4 +174,3 @@ export function apply(ctx: Context): void {
 
 // Re-export the route path constants for diagnostics and tests.
 export { UPDATE_PATHS }
-

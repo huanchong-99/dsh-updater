@@ -12,7 +12,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { createRequire } from 'node:module'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,10 +57,16 @@ export interface PluginRecord {
   kind: SourceKind
   /** Local version string (package.json version or short commit). */
   current?: string
-  /** Latest version string available from the source. */
+  /** Latest version string available from the source (and admitted by the running DSH). */
   latest?: string
   /** True when `latest` is strictly newer than `current`. */
   outdated: boolean
+  /**
+   * Newest npm version that exists but is NOT admitted by the running DSH
+   * (its `engines.dsh` / peers reject it). Informational: the panel never
+   * installs it because the launcher would refuse it at boot.
+   */
+  incompatibleLatest?: string
   /** Absolute package directory when resolved. */
   dir?: string
   /** Git facts for git-clone / pnpm-git rows. */
@@ -74,6 +80,10 @@ export interface UpdaterStatus {
   profiles: string[]
   records: PluginRecord[]
   checkedAt: string
+  /** Running DSH version resolved from the installation, when known. */
+  dshVersion?: string
+  /** Whether an update run is in flight on the host right now. */
+  busy: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +107,7 @@ export function isLocalSpec(spec: string): boolean {
 
 /** Whether a dependency spec is a pnpm git-hosted dependency. */
 export function isGitSpec(spec: string): boolean {
-  return /^(?:github:|git\+|git:|git\+ssh:|git\+https?:)|\.git(?:#|$)/.test(spec)
+  return /^(?:github:|gitlab:|bitbucket:|git\+|git:|git\+ssh:|git\+https?:)|\.git(?:#|$)/.test(spec)
 }
 
 /**
@@ -164,7 +174,7 @@ export function readManifest(path: string): Record<string, unknown> | undefined 
   }
 }
 
-/** Run a quick synchronous command and return trimmed stdout (empty on failure). */
+/** Run a quick synchronous local command and return trimmed stdout (empty on failure). */
 function runSyncTrimmed(command: string, args: string[], cwd: string): string {
   const result = spawnSync(command, args, { cwd, encoding: 'utf8', timeout: 10_000 })
   if (result.status !== 0) return ''
@@ -189,24 +199,50 @@ export function readGitInfo(dir: string): GitInfo | undefined {
 }
 
 /**
+ * Run one git command without blocking the event loop (the network probes
+ * fan out across every git-backed row). Resolves to trimmed stdout, or
+ * undefined on a non-zero exit, a spawn failure, or the timeout.
+ */
+function runGitAsync(args: string[], timeoutMs: number): Promise<string | undefined> {
+  return new Promise((resolvePromise) => {
+    let stdout = ''
+    let settled = false
+    const finish = (value: string | undefined): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise(value)
+    }
+    const child = spawn('git', args, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      // Never block on a credential prompt from inside the host process.
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    })
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM')
+      finish(undefined)
+    }, timeoutMs)
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8') })
+    child.on('error', () => { finish(undefined) })
+    child.on('close', (code) => { finish(code === 0 ? stdout.trim() : undefined) })
+  })
+}
+
+/**
  * Probe the latest commit of a remote git ref (branch, tag, or HEAD; a full
  * commit hash is not probed because a pinned commit is fixed by definition).
  * Returns the short hash, or undefined on any failure.
  */
-export function fetchLatestCommit(remote: string, ref?: string): string | undefined {
-  if (remote === '' || ref === undefined || ref === '') {
-    return fetchLatestCommit(remote, 'HEAD')
-  }
+export async function fetchLatestCommit(remote: string, ref?: string, timeoutMs = 15_000): Promise<string | undefined> {
+  if (remote === '') return undefined
+  if (ref === undefined || ref === '') return fetchLatestCommit(remote, 'HEAD', timeoutMs)
   if (/^[0-9a-fA-F]{40}$/.test(ref)) return undefined
   const patterns = ref === 'HEAD'
     ? ['HEAD']
     : [ref, `refs/heads/${ref}`, `refs/tags/${ref}`]
-  const result = spawnSync('git', ['ls-remote', remote, ...patterns], {
-    encoding: 'utf8',
-    timeout: 15_000,
-  })
-  if (result.status !== 0) return undefined
-  const first = result.stdout.trim().split(/\s+/)[0]
+  const output = await runGitAsync(['ls-remote', remote, ...patterns], timeoutMs)
+  if (output === undefined) return undefined
+  const first = output.split(/\s+/)[0]
   return first === undefined || first === '' ? undefined : first.slice(0, 7)
 }
 
@@ -218,16 +254,20 @@ export interface GitSpecRef {
 
 /**
  * Parse a pnpm git-hosted dependency spec into a remote URL + ref. Supports
- * `github:owner/repo#ref`, `git+https://...git#ref`, and scp-like URLs.
+ * `github:owner/repo#ref`, `git+https://...git#ref`, scp-like URLs, and the
+ * `&path:/sub/dir` suffix the DSH plugin market appends for monorepos.
  */
 export function parseGitSpec(spec: string): GitSpecRef | undefined {
   const hashIndex = spec.indexOf('#')
   const base = hashIndex >= 0 ? spec.slice(0, hashIndex) : spec
-  const ref = hashIndex >= 0 ? spec.slice(hashIndex + 1) || undefined : undefined
+  const fragment = hashIndex >= 0 ? spec.slice(hashIndex + 1) : ''
+  // `#<ref>&path:/dir` → ref only; a bare `#path:/dir` carries no ref.
+  const refPart = fragment.split('&').find(part => part !== '' && !part.startsWith('path:'))
+  const ref = refPart === undefined ? undefined : refPart.replace(/^(?:semver|tag|branch|commit):/, '') || undefined
   let remote: string | undefined
-  const githubMatch = /^github:([^/]+\/[A-Za-z0-9_.-]+)/.exec(base)
-  if (githubMatch !== null) {
-    remote = `https://github.com/${githubMatch[1]}.git`
+  const hostedMatch = /^(github|gitlab|bitbucket):([^/]+\/[A-Za-z0-9_.-]+)/.exec(base)
+  if (hostedMatch !== null) {
+    remote = `https://${hostedMatch[1]}.com/${hostedMatch[2].replace(/\.git$/, '')}.git`
   } else {
     const urlMatch = /^(?:git\+|git:)?(https?:\/\/\S+|ssh:\/\/\S+|git@\S+)$/.exec(base)
     if (urlMatch !== null) remote = urlMatch[1]
@@ -235,12 +275,17 @@ export function parseGitSpec(spec: string): GitSpecRef | undefined {
   return remote === undefined ? undefined : { remote, ref }
 }
 
-/** Read the full 40-hex commit pnpm resolved for one git-hosted dependency. */
+/**
+ * Read the full 40-hex commit pnpm resolved for one git-hosted dependency,
+ * from the profile lockfile. Covers the GitHub tarball form
+ * (`.../tar.gz/<sha>`) and the generic `git+<url>#<sha>` form pnpm writes
+ * for other hosts.
+ */
 export function readPnpmGitResolution(profileDir: string, name: string): string | undefined {
   try {
     const lock = readFileSync(join(profileDir, 'pnpm-lock.yaml'), 'utf8')
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const re = new RegExp(`${escaped}@https://[^\\s]+/tar\\.gz/([0-9a-f]{40})`)
+    const re = new RegExp(`${escaped}@(?:git\\+)?[^\\s'"]*?(?:/tar\\.gz/|#)([0-9a-f]{40})`)
     const match = re.exec(lock)
     return match?.[1]
   } catch {
@@ -273,6 +318,32 @@ export function resolveInstalledDir(profileDir: string, name: string): string | 
 export function readPackageVersion(dir: string): string | undefined {
   const version = readManifest(join(dir, 'package.json'))?.version
   return typeof version === 'string' ? version : undefined
+}
+
+/**
+ * The running DSH version: the in-box `@deepseek-ai/dsh-base` bundle resolves
+ * from the installation for every profile (all official packages ship in
+ * lockstep), else the `@deepseek-ai/dsh` package above the running launcher
+ * script. Used for the `engines.dsh` admission filter and shown in the panel.
+ */
+export function readDshRuntimeVersion(profileDirs: readonly string[], entryScript: string | undefined = process.argv[1]): string | undefined {
+  for (const dir of profileDirs) {
+    for (const name of ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh']) {
+      const installed = resolveInstalledDir(dir, name)
+      const version = installed === undefined ? undefined : readPackageVersion(installed)
+      if (version !== undefined) return version
+    }
+  }
+  if (entryScript === undefined) return undefined
+  let current = dirname(resolve(entryScript))
+  for (let depth = 0; depth < 8; depth++) {
+    const manifest = readManifest(join(current, 'package.json'))
+    if (manifest?.name === '@deepseek-ai/dsh' && typeof manifest.version === 'string') return manifest.version
+    const parent = dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +437,8 @@ export function inspectDependency(profile: string, profileDir: string, name: str
 export function scanProfiles(home: string = dshHome()): UpdaterStatus {
   const records: PluginRecord[] = []
   const profiles: string[] = []
-  for (const { name, dir } of listProfileDirs(home)) {
+  const profileDirs = listProfileDirs(home)
+  for (const { name, dir } of profileDirs) {
     profiles.push(name)
     const manifest = readManifest(join(dir, 'package.json'))
     const dependencies = manifest?.dependencies
@@ -393,7 +465,13 @@ export function scanProfiles(home: string = dshHome()): UpdaterStatus {
       }
     }
   }
-  return { profiles, records, checkedAt: new Date().toISOString() }
+  return {
+    profiles,
+    records,
+    checkedAt: new Date().toISOString(),
+    dshVersion: readDshRuntimeVersion(profileDirs.map(entry => entry.dir)),
+    busy: false,
+  }
 }
 
 /** Classify a profile bundle that has no matching dependency entry. */
