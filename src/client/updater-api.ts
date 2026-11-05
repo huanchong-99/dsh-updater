@@ -4,13 +4,13 @@
  */
 
 import type { UpdaterStatus } from '../inventory.ts'
-import type { UpdateRunResult } from '../update.ts'
+import type { JobView } from '../jobs.ts'
 
 /** Error thrown when a plugin-updater call fails, carrying the HTTP status. */
 export class UpdaterHttpError extends Error {
   /** HTTP status of the failed response (0 when the fetch never returned). */
   readonly status: number
-  constructor(operation: 'status' | 'run', status: number) {
+  constructor(operation: 'status' | 'run' | 'job', status: number) {
     super(`plugin updater ${operation} unavailable (HTTP ${String(status)})`)
     this.status = status
   }
@@ -21,34 +21,47 @@ export interface RunRequest {
   profile?: string
   name?: string
   all?: boolean
+  /** Update everything DSH's plugin manager installed in the running profile. */
+  pluginManager?: boolean
   /** Allow dirty git-clone work trees to update via `git pull --autostash`. */
   autostash?: boolean
 }
 
-/**
- * Probe the plugin-updater status.
- * @returns the scan snapshot.
- * @throws {UpdaterHttpError} 403 when the page is not a loopback origin, 0 on network failure.
- */
-export async function fetchUpdaterStatus(): Promise<UpdaterStatus> {
+/** The status answer: the scan plus the current job, when there is one. */
+export type StatusAnswer = UpdaterStatus & { job?: JobView }
+
+async function getJson<T>(operation: 'status' | 'job', url: string): Promise<T> {
   let response: Response
   try {
-    response = await fetch('/api/plugin-updater/status', { cache: 'no-store' })
+    response = await fetch(url, { cache: 'no-store' })
   } catch {
-    throw new UpdaterHttpError('status', 0)
+    throw new UpdaterHttpError(operation, 0)
   }
-  if (!response.ok) throw new UpdaterHttpError('status', response.status)
-  return await response.json() as UpdaterStatus
+  if (!response.ok) throw new UpdaterHttpError(operation, response.status)
+  return await response.json() as T
 }
 
 /**
- * Run one update. Blocks until the host executor finishes — the panel shows
- * an in-flight state meanwhile.
- * @param body - `{ profile, name }`, `{ profile, all: true }`, or `{ all: true }`.
- * @returns the run outcome.
- * @throws {UpdaterHttpError} 409 when another run is already in flight, 403 off loopback.
+ * Probe the plugin-updater status (scan + network probes + current job).
+ * @throws {UpdaterHttpError} 403 when the page is not a loopback origin, 0 on network failure.
  */
-export async function runPluginUpdate(body: RunRequest): Promise<UpdateRunResult> {
+export function fetchUpdaterStatus(): Promise<StatusAnswer> {
+  return getJson<StatusAnswer>('status', '/api/plugin-updater/status')
+}
+
+/** Read only the current job (cheap; polled while a job runs). */
+export function fetchUpdaterJob(): Promise<{ busy: boolean; job: JobView | null }> {
+  return getJson('job', '/api/plugin-updater/job')
+}
+
+/**
+ * Start an update job. The host answers at once; progress comes from
+ * {@link fetchUpdaterJob}.
+ * @param body - `{ profile, name }`, `{ profile, all: true }`, `{ all: true }`, or `{ pluginManager: true }`.
+ * @returns the started job's first snapshot.
+ * @throws {UpdaterHttpError} 409 when another job is running, 403 off loopback, 400 for a malformed body.
+ */
+export async function runPluginUpdate(body: RunRequest): Promise<JobView> {
   let response: Response
   try {
     response = await fetch('/api/plugin-updater/run', {
@@ -60,5 +73,6 @@ export async function runPluginUpdate(body: RunRequest): Promise<UpdateRunResult
     throw new UpdaterHttpError('run', 0)
   }
   if (!response.ok) throw new UpdaterHttpError('run', response.status)
-  return await response.json() as UpdateRunResult
+  const answer = await response.json() as { job: JobView }
+  return answer.job
 }

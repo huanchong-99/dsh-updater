@@ -1,11 +1,11 @@
-/** Route family: trust fence, busy guard, request routing — no real pnpm/git. */
+/** Route family: trust fence, job start / single-flight / polling — no real pnpm/git. */
 
 import { describe, expect, it } from 'vitest'
 import { EventEmitter } from 'node:events'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { isTrustedUpdaterRequest, makeUpdaterRoutes, runRequested, UPDATE_PATHS, type UpdaterRoutesDeps } from '../src/routes.ts'
-import type { PluginRecord, UpdaterStatus } from '../src/inventory.ts'
-import type { UpdateRunResult, UpdateTarget } from '../src/update.ts'
+import { isTrustedUpdaterRequest, makeUpdaterRoutes, UPDATE_PATHS, type UpdaterRoutesDeps } from '../src/routes.ts'
+import type { UpdaterStatus } from '../src/inventory.ts'
+import { JobStore, type JobPlan, type JobView } from '../src/jobs.ts'
 
 const loopback = (headers: Record<string, string>, remoteAddress = '127.0.0.1') => ({ socket: { remoteAddress }, headers })
 
@@ -28,68 +28,6 @@ describe('isTrustedUpdaterRequest', () => {
     expect(isTrustedUpdaterRequest(loopback({ host: 'localhost', origin: 'http://localhost:80' }))).toBe(true)
     expect(isTrustedUpdaterRequest(loopback({ host: 'localhost:3080', origin: 'null' }))).toBe(false)
     expect(isTrustedUpdaterRequest(loopback({ host: 'localhost:3080', origin: 'file:///x' }))).toBe(false)
-  })
-})
-
-function record(overrides: Partial<PluginRecord>): PluginRecord {
-  return { profile: 'web', name: 'dsh-foo', spec: '1.0.0', kind: 'npm', outdated: true, current: '1.0.0', latest: '1.1.0', ...overrides }
-}
-
-function deps(records: PluginRecord[], run: UpdaterRoutesDeps['run'] = async () => ({ ok: true, exitCode: 0, output: 'ok' })): UpdaterRoutesDeps {
-  const status: UpdaterStatus = { profiles: ['web', 'tui'], records, checkedAt: 'now', busy: false }
-  return {
-    fence: () => true,
-    status: async () => status,
-    resolveTarget: (entry): UpdateTarget | undefined => entry.kind === 'installation-owned' || entry.kind === 'local-only'
-      ? undefined
-      : { profile: entry.profile, profileDir: '/p/' + entry.profile, name: entry.name, kind: entry.kind, spec: entry.spec, gitRoot: entry.git?.root },
-    run,
-  }
-}
-
-describe('runRequested', () => {
-  it('rejects a body that names nothing', async () => {
-    const result = await runRequested(deps([record({})]), {})
-    expect(result.ok).toBe(false)
-    expect(result.errorCode).toBe('not-found')
-  })
-
-  it('updates one named package within a profile', async () => {
-    const seen: string[] = []
-    const result = await runRequested(deps([record({}), record({ profile: 'tui' })], async (target) => {
-      seen.push(`${target.profile}/${target.name}`)
-      return { ok: true, exitCode: 0, output: '' }
-    }), { profile: 'tui', name: 'dsh-foo' })
-    expect(result.ok).toBe(true)
-    expect(seen).toEqual(['tui/dsh-foo'])
-  })
-
-  it('with all:true updates only outdated rows, dedupes git roots, and stops at the first failure', async () => {
-    const seen: string[] = []
-    const rows = [
-      record({ name: 'a', kind: 'git-clone', git: { root: '/clone' } }),
-      record({ name: 'b', kind: 'git-clone', git: { root: '/clone' } }),
-      record({ name: 'c', outdated: false }),
-      record({ name: 'd', kind: 'installation-owned' }),
-      record({ name: 'e' }),
-      record({ name: 'f' }),
-    ]
-    const result = await runRequested(deps(rows, async (target) => {
-      seen.push(target.name)
-      return target.name === 'e' ? { ok: false, exitCode: 1, output: 'boom', errorCode: 'pnpm-failed' } : { ok: true, exitCode: 0, output: '' }
-    }), { all: true })
-    expect(seen).toEqual(['a', 'e'])
-    expect(result.ok).toBe(false)
-    expect(result.output).toContain('web / e')
-  })
-
-  it('passes autostash through as a run option', async () => {
-    let autostash: boolean | undefined
-    await runRequested(deps([record({ kind: 'git-clone' })], async (_target, options) => {
-      autostash = options?.autostash
-      return { ok: true, exitCode: 0, output: '' }
-    }), { profile: 'web', name: 'dsh-foo', autostash: true })
-    expect(autostash).toBe(true)
   })
 })
 
@@ -116,51 +54,84 @@ function fakeResponse(): { res: ServerResponse; done: Promise<{ status: number; 
   return { res, done }
 }
 
+const STATUS: UpdaterStatus = { profiles: ['web'], records: [], checkedAt: 'now', busy: false }
+
+function routesWith(plan: UpdaterRoutesDeps['plan'], rejection: 401 | 403 | undefined = undefined): { routes: ReturnType<typeof makeUpdaterRoutes>; jobs: JobStore } {
+  const jobs = new JobStore()
+  return { jobs, routes: makeUpdaterRoutes({ fence: () => rejection, status: async () => STATUS, plan, jobs }) }
+}
+
+async function call(route: ReturnType<typeof makeUpdaterRoutes>[number], method: string, body?: string): Promise<{ status: number; body: unknown }> {
+  const response = fakeResponse()
+  await route.handler(fakeRequest(method, body), response.res)
+  return response.done
+}
+
 describe('makeUpdaterRoutes', () => {
-  it('registers the two exact routes and answers 405 / 403 / 200 on status', async () => {
-    const routes = makeUpdaterRoutes(deps([]))
-    expect(routes.map(route => [route.kind, route.path])).toEqual([['exact', UPDATE_PATHS.status], ['exact', UPDATE_PATHS.run]])
-    const [status] = routes
-    const wrong = fakeResponse()
-    await status.handler(fakeRequest('POST'), wrong.res)
-    expect((await wrong.done).status).toBe(405)
-    const ok = fakeResponse()
-    await status.handler(fakeRequest('GET'), ok.res)
-    const answer = await ok.done
+  it('registers the three exact routes and enforces method and fence', async () => {
+    const { routes } = routesWith(async () => ({ steps: [], settled: [] }))
+    expect(routes.map(route => [route.kind, route.path])).toEqual([
+      ['exact', UPDATE_PATHS.status], ['exact', UPDATE_PATHS.run], ['exact', UPDATE_PATHS.job],
+    ])
+    const [status, run, job] = routes
+    expect((await call(status, 'POST')).status).toBe(405)
+    expect((await call(run, 'GET')).status).toBe(405)
+    expect((await call(job, 'POST')).status).toBe(405)
+    const answer = await call(status, 'GET')
     expect(answer.status).toBe(200)
-    expect((answer.body as UpdaterStatus).busy).toBe(false)
-    const fenced = makeUpdaterRoutes({ ...deps([]), fence: () => false })
-    const denied = fakeResponse()
-    await fenced[0].handler(fakeRequest('GET'), denied.res)
-    expect((await denied.done).status).toBe(403)
+    expect(answer.body).toMatchObject({ busy: false })
+    for (const rejection of [401, 403] as const) {
+      const fenced = routesWith(async () => ({ steps: [], settled: [] }), rejection).routes
+      for (const [route, method] of [[fenced[0], 'GET'], [fenced[1], 'POST'], [fenced[2], 'GET']] as const) {
+        const answer = await call(route, method, '{}')
+        expect(answer.status).toBe(rejection)
+        expect(answer.body).toMatchObject({ code: rejection === 401 ? 'unauthorized' : 'forbidden' })
+      }
+    }
   })
 
-  it('answers 409 to a second run while one is in flight and reports busy in status', async () => {
-    let release!: (value: UpdateRunResult) => void
-    const gate = new Promise<UpdateRunResult>((r) => { release = r })
-    const routes = makeUpdaterRoutes(deps([record({})], () => gate))
-    const [status, run] = routes
-    const first = fakeResponse()
-    const firstDone = run.handler(fakeRequest('POST', JSON.stringify({ profile: 'web', name: 'dsh-foo' })), first.res)
-    await new Promise(resolve => setTimeout(resolve, 10))
-    const second = fakeResponse()
-    await run.handler(fakeRequest('POST', JSON.stringify({ all: true })), second.res)
-    expect((await second.done).status).toBe(409)
-    const during = fakeResponse()
-    await status.handler(fakeRequest('GET'), during.res)
-    expect(((await during.done).body as UpdaterStatus).busy).toBe(true)
-    release({ ok: true, exitCode: 0, output: 'done' })
-    await firstDone
-    expect((await first.done).status).toBe(200)
-    const after = fakeResponse()
-    await status.handler(fakeRequest('GET'), after.res)
-    expect(((await after.done).body as UpdaterStatus).busy).toBe(false)
+  it('rejects malformed bodies and scopes with 400', async () => {
+    const [, run] = routesWith(async () => ({ steps: [], settled: [] })).routes
+    expect((await call(run, 'POST', '{not json')).status).toBe(400)
+    expect((await call(run, 'POST', '"x"')).status).toBe(400)
+    expect((await call(run, 'POST', '{}')).status).toBe(400)
   })
 
-  it('rejects malformed JSON with 400', async () => {
-    const [, run] = makeUpdaterRoutes(deps([]))
-    const bad = fakeResponse()
-    await run.handler(fakeRequest('POST', '{not json'), bad.res)
-    expect((await bad.done).status).toBe(400)
+  it('starts a job with 202, answers 409 while it runs, and exposes progress on /job and /status', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let seenRequest: unknown
+    const plan = async (request: unknown): Promise<JobPlan> => {
+      seenRequest = request
+      return {
+        steps: [{
+          item: { key: 'web\0dsh-foo', profile: 'web', name: 'dsh-foo', via: 'plugin-manager', kind: 'registry', from: '1.0.0', to: '1.1.0', state: 'pending' },
+          run: async () => { await gate; return { state: 'done', application: 'applied' } },
+        }],
+        settled: [],
+      }
+    }
+    const { routes, jobs } = routesWith(plan)
+    const [status, run, job] = routes
+    const started = await call(run, 'POST', JSON.stringify({ pluginManager: true }))
+    expect(started.status).toBe(202)
+    expect((started.body as { job: JobView }).job.scope).toEqual({ type: 'plugin-manager' })
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(seenRequest).toEqual({ pluginManager: true })
+    const second = await call(run, 'POST', JSON.stringify({ all: true }))
+    expect(second.status).toBe(409)
+    expect(second.body).toMatchObject({ code: 'busy' })
+    const during = await call(job, 'GET')
+    expect(during.body).toMatchObject({ busy: true, job: { phase: 'running', items: [{ name: 'dsh-foo', state: 'running' }] } })
+    expect((await call(status, 'GET')).body).toMatchObject({ busy: true, job: { phase: 'running' } })
+    release()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    expect(jobs.running).toBe(false)
+    expect((await call(job, 'GET')).body).toMatchObject({ busy: false, job: { phase: 'finished', items: [{ state: 'done', application: 'applied' }] } })
+  })
+
+  it('answers job:null before any job ran', async () => {
+    const [, , job] = routesWith(async () => ({ steps: [], settled: [] })).routes
+    expect((await call(job, 'GET')).body).toEqual({ busy: false, job: null })
   })
 })

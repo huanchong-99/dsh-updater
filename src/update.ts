@@ -239,6 +239,11 @@ export interface UpdateTarget {
   autostash?: boolean
 }
 
+/** Progress callback: the step an executor moved to (`pulling`, `installing`, `building`, `waiting-lock`). */
+export type StepReporter = (step: string) => void
+
+const noStep: StepReporter = () => {}
+
 /** The pnpm 11 supply-chain gate override: a user-initiated update must not be silently skipped. */
 const MIN_RELEASE_AGE_OVERRIDE = '--config.minimumReleaseAge=0'
 
@@ -338,7 +343,7 @@ export async function reconcileProfileBundles(profileDir: string): Promise<void>
  * Then install and build at the git root. One git root is updated once even
  * when several packages point into the same clone (the run endpoint dedupes).
  */
-export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunResult> {
+export async function updateGitClone(target: UpdateTarget, onStep: StepReporter = noStep): Promise<UpdateRunResult> {
   const root = target.gitRoot ?? target.dir
   if (root === undefined) return notFoundResult('git root missing')
   const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
@@ -352,6 +357,7 @@ export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunRes
   const isDirty = dirtyProbe.output.trim() !== ''
 
   let pull: CommandOutcome
+  onStep('pulling')
   if (isDirty && target.autostash === true) {
     pull = await runCommand('git', ['-C', root, 'pull', '--ff-only', '--autostash'], { cwd: root, env: gitEnv })
     if (pull.timedOut) return timeoutResult('git pull', pull.output)
@@ -388,6 +394,7 @@ export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunRes
   const hasBuild = typeof (rootManifest?.scripts as { build?: string } | undefined)?.build === 'string'
 
   let install: UpdateRunResult
+  onStep('installing')
   if (existsSync(join(root, 'pnpm-lock.yaml'))) {
     install = await runWithManagerFallback(pnpmCandidates(['install']), { cwd: root })
   } else if (existsSync(join(root, 'yarn.lock'))) {
@@ -401,6 +408,7 @@ export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunRes
     return { ok: true, exitCode: 0, output: capOutput(pull.output + '\n' + install.output + '\n(no build script; install complete)') }
   }
   const buildCommand = existsSync(join(root, 'pnpm-lock.yaml')) ? 'pnpm' : existsSync(join(root, 'yarn.lock')) ? 'yarn' : 'npm'
+  onStep('building')
   const build = await runCommand(buildCommand, ['run', 'build'], { cwd: root })
   if (build.timedOut) return timeoutResult(buildCommand + ' run build', pull.output + '\n' + install.output + '\n' + build.output)
   if (build.code !== 0) {
@@ -410,9 +418,11 @@ export async function updateGitClone(target: UpdateTarget): Promise<UpdateRunRes
 }
 
 /** Run one pnpm operation inside the profile under the shared profile lock. */
-async function runPnpmInProfile(target: UpdateTarget, args: string[]): Promise<UpdateRunResult> {
+async function runPnpmInProfile(target: UpdateTarget, args: string[], onStep: StepReporter): Promise<UpdateRunResult> {
   try {
+    onStep('waiting-lock')
     return await withProfileLock(target.profileDir, async () => {
+      onStep('installing')
       const result = await runWithManagerFallback(pnpmCandidates(args), { cwd: target.profileDir })
       if (result.ok) await reconcileProfileBundles(target.profileDir)
       return result
@@ -433,14 +443,14 @@ async function runPnpmInProfile(target: UpdateTarget, args: string[]): Promise<U
  * configured, because dsh writes exact specs that plain `pnpm update` treats
  * as pinned. Both override the pnpm 11 minimumReleaseAge gate.
  */
-export async function updateNpmPackage(target: UpdateTarget): Promise<UpdateRunResult> {
+export async function updateNpmPackage(target: UpdateTarget, onStep: StepReporter = noStep): Promise<UpdateRunResult> {
   if (!isSafeArgument(target.name) || (target.version !== undefined && !isSafeArgument(target.version))) {
     return { ok: false, exitCode: null, output: '', error: 'package name or version contains unsafe characters', errorCode: 'unsupported' }
   }
   const args = target.version === undefined
     ? ['update', '--latest', '--config.save-exact=true', MIN_RELEASE_AGE_OVERRIDE, target.name]
     : ['add', `${target.name}@${target.version}`, '--save-exact', MIN_RELEASE_AGE_OVERRIDE]
-  return runPnpmInProfile(target, args)
+  return runPnpmInProfile(target, args, onStep)
 }
 
 /**
@@ -448,19 +458,19 @@ export async function updateNpmPackage(target: UpdateTarget): Promise<UpdateRunR
  * re-resolves the git ref and rebuilds it. Fixed-commit specs are still
  * re-resolved (no-op when the commit did not change).
  */
-export async function updatePnpmGitPackage(target: UpdateTarget): Promise<UpdateRunResult> {
+export async function updatePnpmGitPackage(target: UpdateTarget, onStep: StepReporter = noStep): Promise<UpdateRunResult> {
   if (!isSafeArgument(target.spec)) {
     return { ok: false, exitCode: null, output: '', error: 'dependency spec contains unsafe characters', errorCode: 'unsupported' }
   }
-  return runPnpmInProfile(target, ['add', target.spec, MIN_RELEASE_AGE_OVERRIDE])
+  return runPnpmInProfile(target, ['add', target.spec, MIN_RELEASE_AGE_OVERRIDE], onStep)
 }
 
 /** Dispatch one update target to its executor. */
-export async function runTargetUpdate(target: UpdateTarget): Promise<UpdateRunResult> {
+export async function runTargetUpdate(target: UpdateTarget, onStep: StepReporter = noStep): Promise<UpdateRunResult> {
   switch (target.kind) {
-    case 'git-clone': return updateGitClone(target)
-    case 'npm': return updateNpmPackage(target)
-    case 'pnpm-git': return updatePnpmGitPackage(target)
+    case 'git-clone': return updateGitClone(target, onStep)
+    case 'npm': return updateNpmPackage(target, onStep)
+    case 'pnpm-git': return updatePnpmGitPackage(target, onStep)
     default: return {
       ok: false,
       exitCode: null,

@@ -8,19 +8,43 @@ install source, shows current vs latest versions, and runs updates from the
 plugin packages are imported at runtime, so it keeps working even if you
 uninstall every other community plugin.
 
-## Why, when DSH has a Plugins page
+## One click for everything the Plugins page installed
 
-DSH 0.2 ships its own **Plugins** page, which installs, removes, and updates
-bundles — but its update path only covers packages that were installed from an
-**npm registry** under their own name. This tab adds what that page does not do:
+DSH 0.2 ships its own **Plugins** page. It can update each plugin it
+installed, but only one at a time, by opening the plugin and clicking
+**Update**. The card at the top of this tab runs that same Update for all of
+them in one go:
+
+- It calls DSH's own plugin manager (`ctx.pluginManager`) in the Host
+  process, so every update gets the manager's behavior: the target is checked
+  against the running DSH first, the old version is removed and the new one
+  installed with the same selection, the change applies live when HMR is on,
+  and a version that fails to install or start is rolled back to the old one.
+- Third-party registry plugins move to the version the Plugins page would
+  offer: the newest that declares a bundle, accepts the running DSH, and is
+  neither deprecated nor a prerelease.
+- Official on-demand plugins (Codex, Claude Code, Computer Use subagents) are
+  realigned to the copy that matches the running DSH after a DSH upgrade, the
+  same remove-and-install the Plugins page does, plus a reinstall of the old
+  copy when the new one fails.
+- It covers the profile this DSH process runs, which is the only profile the
+  plugin manager owns. Plugins of other profiles are still updated by this
+  plugin's own executors.
+- Each run is a background job. The tab shows each plugin's step (checking,
+  removing, installing, reinstalling) and outcome: applied, waiting for a
+  restart with the reason, rolled back, or failed. One failed plugin does not
+  stop the others.
+
+What each source gets:
 
 | Source | Built-in Plugins page | dsh-updater |
 |---|---|---|
-| npm registry (`dsh plugin add foo`) | update | update (same `pnpm add foo@<version> --save-exact` shape, pinned to the newest version your running DSH admits) |
+| npm registry (`dsh plugin add foo`), running profile | one plugin at a time | all at once, through the plugin manager |
+| official on-demand plugin after a DSH upgrade | one plugin at a time | all at once, through the plugin manager |
+| npm registry, other profiles | no | `pnpm add foo@<version> --save-exact`, newest version the running DSH admits |
 | local git clone (`link:` / `file:` / `add ./checkout`) | no | `git pull --ff-only` (optionally with autostash) + install + build |
 | git-hosted (`github:` / `gitlab:` / `git+…`) | no | re-add the spec so pnpm re-resolves the ref; compares against `git ls-remote` |
 | local directory without git | no | listed read-only |
-| every profile at once | no (current profile only) | yes |
 
 Both tools take the same profile write lock (`<profile>/package.json.lock`), so
 they never run pnpm in one profile at the same time.
@@ -45,11 +69,16 @@ they never run pnpm in one profile at the same time.
   - `local-only` — a local directory without git metadata; manual only.
 - One git root is updated only once even when several packages point into the
   same clone (monorepo friendly).
-- One update at a time: a second run while one is in flight answers `409`.
-- Loopback-only control API, never reachable through a reverse proxy or from
-  a LAN/phone origin even when DSH serves the Web UI on a network address:
-  - `GET /api/plugin-updater/status`
-  - `POST /api/plugin-updater/run`
+- Updates run as background jobs, one at a time: a second run while one is
+  in flight answers `409`, and closing the page does not stop a job.
+- Control API behind DSH's own browser authentication (the session cookie
+  minted from the `?token=` URL `dsh web` prints) and, on top of that,
+  loopback only — never reachable through a reverse proxy or from a LAN/phone
+  origin even when DSH serves the Web UI on a network address:
+  - `GET /api/plugin-updater/status` — scan, network probes, current job
+  - `POST /api/plugin-updater/run` — `{ pluginManager: true }`, `{ all: true }`,
+    `{ profile, all: true }`, or `{ profile, name }`; answers `202` with the job
+  - `GET /api/plugin-updater/job` — the current job only, cheap to poll
 - Manual updates by default; the tab checks on open and after every run.
 
 ## Compatibility
@@ -60,9 +89,16 @@ they never run pnpm in one profile at the same time.
   shows up at boot rather than as a refused install. For DSH 0.1.x use
   dsh-updater 0.1.x.
 - Node ≥ 24.9 is what DSH 0.2 itself requires; the plugin only needs Node 22+.
-- The panel lives inside the Plugins settings section, which the default
-  `dsh-web-app` composition always mounts. A custom composition without
-  `@deepseek-ai/dsh-client-ui-settings-plugins` has no place for the tab.
+- The panel lives inside the Plugins settings section (shown as "内置插件" in
+  the Chinese UI), which the default `dsh-web-app` composition always mounts.
+  A custom composition without `@deepseek-ai/dsh-client-ui-settings-plugins`
+  has no place for the tab.
+- The one-click card needs the plugin manager, which every base-backed profile
+  (`web` included) mounts. Without it the card says so and the rest of the tab
+  works as before.
+- Verified end to end against DSH 0.2.2-rc.1: a registry plugin and an
+  outdated official plugin updated live from the tab, and a release whose
+  tarball was missing was rolled back to the installed version.
 
 ## Install
 
@@ -90,7 +126,8 @@ Local development:
 dsh plugin --profile web add link:$(pwd)
 ```
 
-Then restart `dsh web` and open **Settings → Plugins → Updates**.
+Then restart `dsh web`, open the URL it prints, and go to **Settings →
+Plugins → Updates**.
 
 ## Development
 
@@ -106,15 +143,18 @@ under `scripts/` exercise the autostash paths against throwaway repositories.
 
 ## How it works
 
-The host half reads profile manifests directly from disk, resolves each
+The host half bridges to DSH's plugin manager whenever the profile mounts one
+(an optional `ctx.inject(['pluginManager', 'profileContext'])` sub-plugin),
+and reads profile manifests directly from disk, resolves each
 dependency with Node's own `node_modules` lookup, and runs `git` / `pnpm` /
 `corepack` / `npx` commands with bounded output and a hard timeout. Registry
 probes use the abbreviated packument, so a status read stays small even for
 packages with hundreds of versions. The browser half registers one
 `settings.plugins.tab` entry and talks only to the plugin's own
-`/api/plugin-updater/*` routes, which are fenced to loopback requests
-(socket address, Host, Origin and Fetch-Metadata checks; `X-Forwarded-For` is
-never trusted).
+`/api/plugin-updater/*` routes. Each route first asks DSH's connection
+service (`ctx.connection.requestRejection`) for the browser-session check,
+then applies its own loopback fence (socket address, Host, Origin and
+Fetch-Metadata checks; `X-Forwarded-For` is never trusted).
 
 After a host-side plugin changes, restart that profile (for example `dsh web`)
 for the new code to load; browser-only changes need a page refresh.

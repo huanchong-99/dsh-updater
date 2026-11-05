@@ -73,6 +73,24 @@ export interface PluginRecord {
   git?: GitInfo
   /** Human-readable per-row failure (probe failed, not found...). */
   error?: string
+  /**
+   * Set on rows of the running profile that DSH's own plugin manager
+   * installed and updates (registry bundles it marks updatable, and official
+   * on-demand bundles); their updates run through the manager.
+   */
+  managedBy?: 'plugin-manager'
+  /** How the manager updates the row: a registry version, or the running DSH's catalog copy. */
+  officialKind?: 'registry' | 'catalog'
+}
+
+/** The plugin manager facts served with the scan, when the running profile has one. */
+export interface PluginManagerSummary {
+  /** Scanned profile name the manager owns (the profile this DSH process runs). */
+  profile: string
+  /** Rows the manager updates. */
+  managed: number
+  /** Of those, rows with an update according to the scan. */
+  outdated: number
 }
 
 /** Full scan result served to the browser half. */
@@ -82,8 +100,10 @@ export interface UpdaterStatus {
   checkedAt: string
   /** Running DSH version resolved from the installation, when known. */
   dshVersion?: string
-  /** Whether an update run is in flight on the host right now. */
+  /** Whether an update job is in flight on the host right now. */
   busy: boolean
+  /** Present when DSH's plugin manager runs in this profile. */
+  pluginManager?: PluginManagerSummary
 }
 
 // ---------------------------------------------------------------------------

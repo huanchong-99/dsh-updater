@@ -1,14 +1,17 @@
 /**
  * The "Updates" tab of the Plugins settings section. Renders the scan result
- * grouped by profile, with per-row source badges, version comparison, and
- * manual update actions. Component-local state per the client stack rules.
+ * grouped by profile, the one-click Plugin Manager card for the running
+ * profile, and the current update job with per-item progress. Updates run as
+ * host-side jobs; the tab polls the cheap job endpoint while one runs and
+ * reads the full status again when it ends.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { PluginRecord, UpdaterStatus } from '../inventory.ts'
-import type { UpdateRunResult } from '../update.ts'
-import { fetchUpdaterStatus, runPluginUpdate, UpdaterHttpError } from './updater-api.ts'
+import type { PluginRecord } from '../inventory.ts'
+import type { JobItem, JobView } from '../jobs.ts'
+import { fetchUpdaterJob, fetchUpdaterStatus, runPluginUpdate, UpdaterHttpError, type RunRequest, type StatusAnswer } from './updater-api.ts'
+import { zh } from './locales.ts'
 import css from './updates.module.css'
 
 /** Composed props of the settings.plugins.tab entry. */
@@ -16,23 +19,21 @@ export type UpdatesTabProps =
   PropsRuntime<'settings.plugins.tab'>
   & PropsLocale<'updater'>
 
-/** Per-row update state. */
-interface RowState {
-  running: boolean
-  result?: UpdateRunResult
-}
+/** Toolbar-level message after a failed call. */
+type NoticeKey = 'forbidden' | 'unauthorized' | 'busyHint' | 'offline' | 'error' | 'job.lost'
 
-/** Aggregate state keyed by `${profile}\0${name}`. */
-type RowStateMap = Record<string, RowState>
+/** Poll interval while a job runs. */
+const POLL_MS = 1200
 
-/** Toolbar-level message after a bulk run or a failed probe. */
-type NoticeKey = 'forbidden' | 'busyHint' | 'offline' | 'error'
+/** Dictionary keys, for dynamic lookups (error codes, steps) with a raw fallback. */
+const KNOWN_KEYS: ReadonlySet<string> = new Set(Object.keys(zh))
 
 const rowKey = (record: PluginRecord): string => `${record.profile}\0${record.name}`
 
 /** Map a thrown transport error onto the notice copy the user should read. */
 function noticeFor(error: unknown): NoticeKey {
   if (error instanceof UpdaterHttpError) {
+    if (error.status === 401) return 'unauthorized'
     if (error.status === 403) return 'forbidden'
     if (error.status === 409) return 'busyHint'
     if (error.status === 0) return 'offline'
@@ -40,13 +41,7 @@ function noticeFor(error: unknown): NoticeKey {
   return 'error'
 }
 
-/** Transport failure rendered as a run result row. */
-function failedResult(error: unknown): UpdateRunResult {
-  if (error instanceof UpdaterHttpError && error.status === 409) {
-    return { ok: false, exitCode: null, output: '', errorCode: 'busy', error: error.message }
-  }
-  return { ok: false, exitCode: null, output: '', error: error instanceof Error ? error.message : String(error) }
-}
+const isRunning = (job: JobView | null | undefined): job is JobView => job !== null && job !== undefined && job.phase !== 'finished'
 
 /**
  * Render the plugin update tab.
@@ -55,11 +50,16 @@ function failedResult(error: unknown): UpdateRunResult {
  */
 export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
   const { t } = props
-  const [status, setStatus] = useState<UpdaterStatus | null>(null)
+  // Dynamic keys (codes from the host) go through this guard so an unknown
+  // code shows its raw text instead of a missing-key marker.
+  const tx = useCallback((key: string, fallback: string, params?: Record<string, unknown>): string =>
+    KNOWN_KEYS.has(key) ? (t as (key: string, params?: Record<string, unknown>) => string)(key, params) : fallback, [t])
+
+  const [status, setStatus] = useState<StatusAnswer | null>(null)
   const [loading, setLoading] = useState(true)
   const [notice, setNotice] = useState<NoticeKey | null>(null)
-  const [rows, setRows] = useState<RowStateMap>({})
-  const [bulk, setBulk] = useState<{ scope: string; result?: UpdateRunResult } | null>(null)
+  const [job, setJob] = useState<JobView | null>(null)
+  const [dismissed, setDismissed] = useState<string | null>(null)
   // Monotonic request token: a stale status response never overwrites a newer one.
   const probe = useRef(0)
   const mounted = useRef(true)
@@ -67,10 +67,12 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
   const check = useCallback(async (): Promise<void> => {
     const token = ++probe.current
     setLoading(true)
-    setNotice(null)
+    setNotice(previous => (previous === 'job.lost' ? previous : null))
     try {
       const next = await fetchUpdaterStatus()
-      if (mounted.current && token === probe.current) setStatus(next)
+      if (!mounted.current || token !== probe.current) return
+      setStatus(next)
+      if (next.job !== undefined) setJob(next.job)
     } catch (error) {
       if (mounted.current && token === probe.current) setNotice(noticeFor(error))
     } finally {
@@ -84,33 +86,43 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
     return () => { mounted.current = false }
   }, [check])
 
-  const runOne = useCallback(async (record: PluginRecord, autostash = false): Promise<void> => {
-    const key = rowKey(record)
-    setRows(prev => ({ ...prev, [key]: { running: true } }))
-    let result: UpdateRunResult
-    try {
-      result = await runPluginUpdate({ profile: record.profile, name: record.name, autostash })
-    } catch (error) {
-      result = failedResult(error)
+  // Poll the job while it runs; read the full status once it ends.
+  const runningId = isRunning(job) ? job.id : null
+  useEffect(() => {
+    if (runningId === null) return
+    let stopped = false
+    const timer = setInterval(() => {
+      void fetchUpdaterJob().then((answer) => {
+        if (stopped || !mounted.current) return
+        if (answer.job === null || answer.job.id !== runningId) {
+          // The updater replaced itself (new module, fresh store): the old
+          // job's record is gone. Treat it as finished and look again.
+          setJob(previous => (previous === null ? null : { ...previous, phase: 'finished' }))
+          setNotice('job.lost')
+          void check()
+          return
+        }
+        setJob(answer.job)
+        if (answer.job.phase === 'finished') void check()
+      }).catch(() => { /* transient: the next tick retries */ })
+    }, POLL_MS)
+    return () => {
+      stopped = true
+      clearInterval(timer)
     }
-    if (!mounted.current) return
-    setRows(prev => ({ ...prev, [key]: { running: false, result } }))
-    void check()
-  }, [check])
+  }, [runningId, check])
 
-  const runBulk = useCallback(async (profile?: string): Promise<void> => {
-    const scope = profile ?? '*'
-    setBulk({ scope })
-    let result: UpdateRunResult
+  const start = useCallback(async (body: RunRequest): Promise<void> => {
+    setNotice(null)
     try {
-      result = await runPluginUpdate(profile === undefined ? { all: true } : { profile, all: true })
+      const started = await runPluginUpdate(body)
+      if (!mounted.current) return
+      setDismissed(null)
+      setJob(started)
     } catch (error) {
-      result = failedResult(error)
+      if (mounted.current) setNotice(noticeFor(error))
     }
-    if (!mounted.current) return
-    setBulk({ scope, result })
-    void check()
-  }, [check])
+  }, [])
 
   const groups = useMemo(() => {
     if (status === null) return []
@@ -128,10 +140,13 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
     }))
   }, [status])
 
+  const jobItems = useMemo(() => new Map((job?.items ?? []).map(item => [item.key, item])), [job])
   const outdatedCount = status?.records.filter(record => record.outdated).length ?? 0
-  const bulkRunning = bulk !== null && bulk.result === undefined
-  const anyRowRunning = Object.values(rows).some(row => row.running)
-  const busy = bulkRunning || anyRowRunning || status?.busy === true
+  const busy = isRunning(job) || status?.busy === true
+  const pm = status?.pluginManager
+  // Rows the preview could not confirm (registry unreachable) may still have an
+  // update the manager finds; they keep the one-click button available.
+  const pmUnknown = status?.records.filter(record => record.managedBy === 'plugin-manager' && record.latest === undefined).length ?? 0
 
   /** A row is actionable only when the status probe found an update, or when
    *  the probe could not confirm a latest version (network failure). Once a
@@ -142,25 +157,106 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
     return record.latest === undefined
   }
 
-  const describe = (result: UpdateRunResult): string => {
-    if (result.ok) return t('done')
-    if (result.errorCode !== undefined) return t(`errorCode.${result.errorCode}`)
-    return result.error ?? t('error')
+  /** One line describing an item's state and outcome. */
+  const describeItem = (item: JobItem): string => {
+    switch (item.state) {
+      case 'pending': return t('state.pending')
+      case 'running': {
+        const step = item.step === undefined ? '' : ` · ${tx(`step.${item.step}`, item.step)}`
+        return t('state.running') + step
+      }
+      case 'skipped': return tx(`skip.${item.skipReason ?? ''}`, t('state.skipped'))
+      case 'done': {
+        if (item.application === 'restart-required') {
+          return t('app.restart-required', { reason: tx(`restart.${item.restartReason ?? ''}`, item.restartReason ?? '-') })
+        }
+        if (item.application !== undefined) return tx(`app.${item.application}`, t('state.done'))
+        return t('state.done')
+      }
+      case 'failed': {
+        const space = item.via === 'plugin-manager' ? 'pmError' : 'errorCode'
+        const reason = item.errorCode !== undefined
+          ? tx(`${space}.${item.errorCode}`, item.errorCode)
+          : item.application === 'cancelled' ? t('app.cancelled') : t('error')
+        const restored = item.restored === undefined ? '' : ` · ${t(`restored.${item.restored}`)}`
+        return `${t('state.failed')}: ${reason}${restored}`
+      }
+    }
   }
 
-  const logOf = (result: UpdateRunResult): string =>
-    [result.ok ? undefined : result.error, result.output].filter((part): part is string => part !== undefined && part !== '').join('\n')
+  /** The item's diagnostics, once: the manager's error text often repeats the streamed pnpm log. */
+  const itemLog = (item: JobItem): string => {
+    const error = item.state === 'failed' || item.state === 'skipped' ? item.error?.trim() ?? '' : ''
+    const output = item.output?.trim() ?? ''
+    if (error === '') return output
+    if (output === '') return error
+    if (output.includes(error)) return output
+    if (error.includes(output)) return error
+    return `${error}\n${output}`
+  }
+
+  const jobTitle = (view: JobView): string => {
+    switch (view.scope.type) {
+      case 'one': return t('job.title.one', { name: view.scope.name })
+      case 'profile': return t('job.title.profile', { profile: view.scope.profile })
+      case 'all': return t('job.title.all')
+      case 'plugin-manager': return t('job.title.plugin-manager')
+    }
+  }
+
+  const jobHeadline = (view: JobView): string => {
+    if (view.phase === 'planning') return t('job.planning')
+    const settled = view.items.filter(item => item.state === 'done' || item.state === 'failed').length
+    const total = view.items.filter(item => item.state !== 'skipped').length
+    if (view.phase === 'running') return t('job.progress', { done: String(settled), total: String(total) })
+    if (view.error !== undefined) return t('job.failedToPlan', { error: view.error })
+    if (view.items.length === 0) return t('job.empty')
+    return t('job.summary', {
+      done: String(view.items.filter(item => item.state === 'done').length),
+      failed: String(view.items.filter(item => item.state === 'failed').length),
+      skipped: String(view.items.filter(item => item.state === 'skipped').length),
+    })
+  }
+
+  const needsRestart = job !== null && job.phase === 'finished' && job.items.some(item => item.state === 'done'
+    && (item.application === 'restart-required' || item.via === 'updater'))
+
+  const stateClass = (item: JobItem): string | undefined =>
+    item.state === 'done' ? css.ok : item.state === 'failed' ? css.error : css.muted
 
   return (
     <div className={css.section}>
       <p className={css.lede}>{t('description')}</p>
 
+      {pm !== undefined && (
+        <section className={css.card} aria-label={t('pm.title')}>
+          <div className={css.cardHead}>
+            <strong>{t('pm.title')}</strong>
+            <span className={css.meta}>{t('pm.profile', { profile: pm.profile })}</span>
+          </div>
+          <p className={css.cardText}>{t('pm.summary', { managed: String(pm.managed), outdated: String(pm.outdated) })}</p>
+          <p className={css.muted}>{t('pm.hint')}</p>
+          <div>
+            <button
+              type="button"
+              className={css.primary}
+              disabled={loading || busy || pm.outdated + pmUnknown === 0}
+              title={pm.outdated + pmUnknown === 0 ? t('updateDisabled') : undefined}
+              onClick={() => { void start({ pluginManager: true }) }}
+            >
+              {isRunning(job) && job.scope.type === 'plugin-manager' ? t('running') : t('pm.updateAll', { count: String(pm.outdated) })}
+            </button>
+          </div>
+        </section>
+      )}
+      {status !== null && pm === undefined && <p className={css.muted}>{t('pm.unavailable')}</p>}
+
       <div className={css.toolbar}>
         <button type="button" className={css.button} onClick={() => { void check() }} disabled={loading}>
           {loading ? t('checking') : t('recheck')}
         </button>
-        <button type="button" className={css.button} onClick={() => { void runBulk() }} disabled={loading || busy || outdatedCount === 0}>
-          {bulkRunning && bulk.scope === '*' ? t('running') : t('updateAll')}
+        <button type="button" className={css.button} onClick={() => { void start({ all: true }) }} disabled={loading || busy || outdatedCount === 0}>
+          {isRunning(job) && job.scope.type === 'all' ? t('running') : t('updateAll')}
         </button>
         {status !== null && (
           <span className={css.meta}>
@@ -171,18 +267,41 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
       </div>
 
       {notice !== null && <p className={notice === 'error' || notice === 'offline' ? css.error : css.muted}>{t(notice)}</p>}
-      {status?.busy === true && !bulkRunning && !anyRowRunning && <p className={css.muted}>{t('busyHint')}</p>}
-      {bulk?.result !== undefined && (
-        <div className={bulk.result.ok ? css.ok : css.error}>
-          <span>{describe(bulk.result)}</span>
-          {logOf(bulk.result) !== '' && (
-            <details className={css.details}>
-              <summary>{t('log')}</summary>
-              <pre className={css.log}>{logOf(bulk.result)}</pre>
-            </details>
+
+      {job !== null && job.id !== dismissed && (
+        <section className={css.card} aria-live="polite">
+          <div className={css.cardHead}>
+            <strong>{jobTitle(job)}</strong>
+            <span className={css.meta}>{jobHeadline(job)}</span>
+            {job.phase === 'finished' && (
+              <button type="button" className={css.button} onClick={() => { setDismissed(job.id) }}>{t('job.dismiss')}</button>
+            )}
+          </div>
+          {needsRestart && <p className={css.muted}>{t('job.restartNeeded')}</p>}
+          {job.items.length > 0 && (
+            <ul className={css.jobList}>
+              {job.items.map(item => (
+                <li key={item.key} className={css.jobItem} data-state={item.state}>
+                  <span className={css.jobName}>{item.name}</span>
+                  <span className={css.via} data-via={item.via}>{t(`via.${item.via}`)}</span>
+                  <span className={css.mono}>{item.profile}</span>
+                  {item.to !== undefined
+                    ? <span className={css.mono}>{item.from ?? '?'} → {item.to}</span>
+                    : item.from !== undefined && <span className={css.mono}>{item.from}</span>}
+                  <span className={stateClass(item)}>{describeItem(item)}</span>
+                  {itemLog(item) !== '' && (
+                    <details className={css.details}>
+                      <summary>{t('log')}</summary>
+                      <pre className={css.log}>{itemLog(item)}</pre>
+                    </details>
+                  )}
+                </li>
+              ))}
+            </ul>
           )}
-        </div>
+        </section>
       )}
+
       {loading && status === null && <p className={css.muted}>{t('checking')}</p>}
       {status !== null && status.records.length === 0 && <p className={css.muted}>{t('empty')}</p>}
 
@@ -209,16 +328,18 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
                     type="button"
                     className={css.button}
                     disabled={loading || busy || group.outdated === 0}
-                    onClick={() => { void runBulk(group.profile) }}
+                    onClick={() => { void start({ profile: group.profile, all: true }) }}
                   >
-                    {bulkRunning && bulk.scope === group.profile ? t('running') : `${t('updateProfile')} (${String(group.outdated)})`}
+                    {isRunning(job) && job.scope.type === 'profile' && job.scope.profile === group.profile
+                      ? t('running')
+                      : `${t('updateProfile')} (${String(group.outdated)})`}
                   </button>
                 </th>
               </tr>
               {group.records.map((record) => {
                 const key = rowKey(record)
-                const row = rows[key]
-                const running = row?.running === true
+                const item = jobItems.get(key)
+                const rowBusy = item !== undefined && (item.state === 'running' || item.state === 'pending')
                 const updatable = record.kind !== 'installation-owned' && record.kind !== 'local-only'
                 const actionable = canUpdate(record)
                 return (
@@ -228,6 +349,9 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
                       <span className={css.badge} data-kind={record.kind} title={t(`sourceLabel.${record.kind}`)}>
                         {t(`kind.${record.kind}`)}
                       </span>
+                      {record.managedBy === 'plugin-manager' && (
+                        <span className={css.via} data-via="plugin-manager" title={t('pm.badgeHint')}>{t('pm.badge')}</span>
+                      )}
                     </td>
                     <td className={css.mono}>
                       <span>{record.current ?? '-'}</span>
@@ -249,22 +373,22 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
                           <button
                             type="button"
                             className={css.button}
-                            disabled={running || busy || !actionable}
-                            title={!actionable && !running ? t('updateDisabled') : undefined}
-                            onClick={() => { void runOne(record) }}
+                            disabled={rowBusy || busy || !actionable}
+                            title={!actionable && !rowBusy ? t('updateDisabled') : undefined}
+                            onClick={() => { void start({ profile: record.profile, name: record.name }) }}
                           >
-                            {running ? t('running') : t('update')}
+                            {rowBusy ? t('running') : t('update')}
                           </button>
                         )}
                         {record.kind === 'git-clone' && (
                           <button
                             type="button"
                             className={css.button}
-                            disabled={running || busy || !actionable}
-                            title={!actionable && !running ? t('updateDisabled') : t('updateStashHint')}
-                            onClick={() => { void runOne(record, true) }}
+                            disabled={rowBusy || busy || !actionable}
+                            title={!actionable && !rowBusy ? t('updateDisabled') : t('updateStashHint')}
+                            onClick={() => { void start({ profile: record.profile, name: record.name, autostash: true }) }}
                           >
-                            {running ? t('running') : t('updateStash')}
+                            {rowBusy ? t('running') : t('updateStash')}
                           </button>
                         )}
                         {updatable && (
@@ -273,16 +397,8 @@ export function UpdatesTab(props: UpdatesTabProps): React.ReactNode {
                           </span>
                         )}
                       </div>
-                      {row?.result !== undefined && (
-                        <div className={row.result.ok ? css.ok : css.error}>
-                          <span>{describe(row.result)}</span>
-                          {logOf(row.result) !== '' && (
-                            <details className={css.details}>
-                              <summary>{t('log')}</summary>
-                              <pre className={css.log}>{logOf(row.result)}</pre>
-                            </details>
-                          )}
-                        </div>
+                      {item !== undefined && !(item.state === 'skipped' && item.skipReason === 'up-to-date') && (
+                        <div className={stateClass(item)}>{describeItem(item)}</div>
                       )}
                       {record.error !== undefined && <div className={css.error} title={record.error}>{record.error}</div>}
                     </td>

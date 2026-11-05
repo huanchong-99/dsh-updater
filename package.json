@@ -1,7 +1,7 @@
 {
   "name": "dsh-updater",
-  "version": "0.2.0",
-  "description": "Plugin update panel for DeepSeek Harness (DSH) 0.2.x: scan every profile dependency, classify npm / git-clone / pnpm-git / local-only sources, show outdated status, and run updates from the Settings → Plugins → Updates tab. Covers git clones and git-hosted installs the built-in Plugins page cannot update. No third-party plugin dependencies.",
+  "version": "0.3.0",
+  "description": "Plugin update panel for DeepSeek Harness (DSH) 0.2.x: scan every profile dependency, classify npm / git-clone / pnpm-git / local-only sources, show outdated status, and run updates from the Settings → Plugins → Updates tab: one click updates everything DSH Plugin Manager installed (through the manager itself), plus git clones and git-hosted installs it cannot update. No third-party plugin dependencies.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

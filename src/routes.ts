@@ -1,55 +1,48 @@
 /**
- * The /api/plugin-updater route family: the status probe and the update run.
- * Both are loopback-only control surfaces — the run endpoint triggers a real
+ * The /api/plugin-updater route family: the status probe, the update run,
+ * and the job progress. All are loopback-only control surfaces — the run endpoint triggers a real
  * git pull / pnpm install on this machine, so it must never be reachable
  * from a LAN or phone origin, even though DSH 0.2.x can serve the Web UI on a
  * network address or behind a trusted reverse proxy.
  *
- * The trust fence is self-contained (the documented Host/Origin semantics of
- * DSH's own /api fence, plus a loopback *socket* requirement on top); this
- * package does not depend on any third-party plugin package.
+ * Every request first passes DSH's own gate (`ctx.connection.requestRejection`:
+ * the browser-session cookie minted from the `?token=` launch URL, plus the
+ * Host/Origin fence), then this plugin's stricter loopback rule (socket
+ * address, Host, Origin). The loopback rule is self-contained; this package
+ * does not depend on any third-party plugin package.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
-import type { PluginRecord, UpdaterStatus } from './inventory.ts'
-import type { UpdateRunResult, UpdateTarget } from './update.ts'
+import type { UpdaterStatus } from './inventory.ts'
+import type { JobPlan, JobStore } from './jobs.ts'
+import { scopeOf, type RunRequestBody } from './planner.ts'
+
+export type { RunRequestBody } from './planner.ts'
 
 /** Route paths (exact matches under /api). */
 export const UPDATE_PATHS = {
   status: '/api/plugin-updater/status',
   run: '/api/plugin-updater/run',
+  job: '/api/plugin-updater/job',
 } as const
 
-/** One update-request body accepted by the run endpoint. */
-export interface RunRequestBody {
-  /** Update every outdated record in this profile. */
-  all?: boolean
-  profile?: string
-  /** Update a single package by name (within `profile` when given). */
-  name?: string
-  /**
-   * Allow dirty git-clone work trees to update via `git pull --ff-only
-   * --autostash`. Defaults to false: dirty clones are refused.
-   */
-  autostash?: boolean
-}
+/** HTTP status refusing a request before dispatch, or undefined to proceed. */
+export type FenceRejection = 401 | 403 | undefined
 
 /** Route-family dependencies (test seam). */
 export interface UpdaterRoutesDeps {
-  /** Loopback-only fence: control endpoints are host-surface only. */
-  fence(request: IncomingMessage): boolean
+  /**
+   * Request gate: DSH's own browser authentication (401) and Host/Origin
+   * fence (403), plus this plugin's loopback-only rule (403).
+   */
+  fence(request: IncomingMessage): FenceRejection
   /** Read the current scan (local disk + network probes). */
   status(): Promise<UpdaterStatus>
-  /** Resolve a concrete update target for one record. */
-  resolveTarget(record: PluginRecord): UpdateTarget | undefined
-  /** Execute one update target and return the result. */
-  run(target: UpdateTarget, options?: UpdateRunOptions): Promise<UpdateRunResult>
-}
-
-/** Optional modifiers for one update run. */
-export interface UpdateRunOptions {
-  autostash?: boolean
+  /** Plan one run request. */
+  plan(request: RunRequestBody): Promise<JobPlan>
+  /** The job store runs execute in. */
+  jobs: JobStore
 }
 
 // ---------------------------------------------------------------------------
@@ -157,120 +150,69 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 // Route factory
 // ---------------------------------------------------------------------------
 
+/** Answer a non-matching method. */
+function methodNotAllowed(res: ServerResponse): void {
+  res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
+  res.end('method not allowed')
+}
+
+/** Answer a fenced request; true when it was refused. */
+function refused(deps: UpdaterRoutesDeps, req: IncomingMessage, res: ServerResponse): boolean {
+  const rejection = deps.fence(req)
+  if (rejection === undefined) return false
+  writeJson(res, rejection, { ok: false, code: rejection === 401 ? 'unauthorized' : 'forbidden' })
+  return true
+}
+
 /**
- * Build the /api/plugin-updater route family. One update run at a time: a
- * second POST while a run is in flight answers 409 instead of starting a
- * concurrent pnpm/git process in the same profile.
- * @param deps - fence + status/resolve/run seams.
+ * Build the /api/plugin-updater route family. One job at a time: a run
+ * request while a job is planning or running answers 409.
+ *  - `GET  status` — full scan with network probes, plus the current job.
+ *  - `POST run`    — plan and start a job; answers 202 with its snapshot.
+ *  - `GET  job`    — the current (or last finished) job only; cheap to poll.
+ * @param deps - fence + status/plan seams and the job store.
  * @returns the exact routes to register on webServer.
  */
 export function makeUpdaterRoutes(deps: UpdaterRoutesDeps): WebRoute[] {
-  let running = false
-
   const handleStatus = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    if (req.method !== 'GET') {
-      res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end('method not allowed')
-      return
-    }
-    if (!deps.fence(req)) {
-      writeJson(res, 403, { ok: false, code: 'forbidden' })
-      return
-    }
+    if (req.method !== 'GET') return methodNotAllowed(res)
+    if (refused(deps, req, res)) return
     try {
       const status = await deps.status()
-      writeJson(res, 200, { ...status, busy: running })
+      const job = deps.jobs.view()
+      writeJson(res, 200, { ...status, busy: deps.jobs.running, ...(job !== undefined ? { job } : {}) })
     } catch (error) {
       writeJson(res, 500, { ok: false, code: 'internal-error', error: error instanceof Error ? error.message : String(error) })
     }
   }
 
+  const handleJob = (req: IncomingMessage, res: ServerResponse): void => {
+    if (req.method !== 'GET') return methodNotAllowed(res)
+    if (refused(deps, req, res)) return
+    writeJson(res, 200, { busy: deps.jobs.running, job: deps.jobs.view() ?? null })
+  }
+
   const handleRun = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    if (req.method !== 'POST') {
-      res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end('method not allowed')
-      return
-    }
-    if (!deps.fence(req)) {
-      writeJson(res, 403, { ok: false, code: 'forbidden' })
-      return
-    }
+    if (req.method !== 'POST') return methodNotAllowed(res)
+    if (refused(deps, req, res)) return
     let body: unknown
     try {
       body = await readJsonBody(req)
     } catch {
-      writeJson(res, 400, { ok: false, code: 'bad-request' })
-      return
+      return writeJson(res, 400, { ok: false, code: 'bad-request' })
     }
-    if (typeof body !== 'object' || body === null) {
-      writeJson(res, 400, { ok: false, code: 'bad-request' })
-      return
-    }
-    if (running) {
-      writeJson(res, 409, { ok: false, code: 'busy' })
-      return
-    }
-    running = true
-    try {
-      const result = await runRequested(deps, body as RunRequestBody)
-      writeJson(res, 200, result)
-    } catch (error) {
-      writeJson(res, 500, { ok: false, code: 'internal-error', error: error instanceof Error ? error.message : String(error) })
-    } finally {
-      running = false
-    }
+    if (typeof body !== 'object' || body === null) return writeJson(res, 400, { ok: false, code: 'bad-request' })
+    const request = body as RunRequestBody
+    const scope = scopeOf(request)
+    if (scope === undefined) return writeJson(res, 400, { ok: false, code: 'bad-request', error: 'name a package, or set all / pluginManager' })
+    const started = deps.jobs.start(scope, () => deps.plan(request))
+    if (started === undefined) return writeJson(res, 409, { ok: false, code: 'busy', job: deps.jobs.view() })
+    writeJson(res, 202, { ok: true, job: started.view })
   }
 
   return [
     { kind: 'exact', path: UPDATE_PATHS.status, handler: handleStatus },
     { kind: 'exact', path: UPDATE_PATHS.run, handler: handleRun },
+    { kind: 'exact', path: UPDATE_PATHS.job, handler: handleJob },
   ]
-}
-
-/**
- * Execute one run request. Supports:
- *  - `{ profile, name }` — update one package
- *  - `{ profile, all: true }` — update every outdated package in a profile
- *  - `{ all: true }` — update every outdated package across profiles
- */
-export async function runRequested(deps: UpdaterRoutesDeps, request: RunRequestBody): Promise<UpdateRunResult> {
-  const status = await deps.status()
-  const options: UpdateRunOptions = { autostash: request.autostash === true }
-  let records = status.records
-  if (request.profile !== undefined) {
-    records = records.filter(record => record.profile === request.profile)
-  }
-  if (request.name !== undefined) {
-    records = records.filter(record => record.name === request.name)
-  } else if (request.all === true) {
-    records = records.filter(record => record.outdated)
-  } else {
-    return { ok: false, exitCode: null, output: '', error: 'run request must name a package or set all:true', errorCode: 'not-found' }
-  }
-  if (records.length === 0) {
-    return { ok: false, exitCode: null, output: '', error: 'no matching package found', errorCode: 'not-found' }
-  }
-  if (records.length > 1) {
-    // Multiple records (e.g. all:true): update sequentially, dedupe by git
-    // root, and fail fast on the first error.
-    const seenGitRoots = new Set<string>()
-    let combined = ''
-    for (const record of records) {
-      const target = deps.resolveTarget(record)
-      if (target === undefined) continue
-      if (target.kind === 'git-clone' && target.gitRoot !== undefined) {
-        if (seenGitRoots.has(target.gitRoot)) continue
-        seenGitRoots.add(target.gitRoot)
-      }
-      const result = await deps.run(target, options)
-      combined += `== ${record.profile} / ${record.name}\n${result.output}\n`
-      if (!result.ok) return { ...result, output: combined }
-    }
-    return { ok: true, exitCode: 0, output: combined }
-  }
-  const target = deps.resolveTarget(records[0])
-  if (target === undefined) {
-    return { ok: false, exitCode: null, output: '', error: `cannot update ${records[0].kind} package`, errorCode: 'unsupported' }
-  }
-  return deps.run(target, options)
 }
